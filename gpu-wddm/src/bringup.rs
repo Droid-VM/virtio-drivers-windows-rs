@@ -24,6 +24,7 @@ pub mod runtime {
         StdAllocSharedPrimary, StdAllocShadow, StdAllocStaging, StdAllocOther,
         // P1: fast path actually taken / mapping failed (fell back) / copies run.
         PresentLocalTaken, PresentLocalMapFail, LocalCopyDone, LocalCopySyncFallback,
+        LocalCopyWake, LocalCopyPublish,
         Count,
     }
 
@@ -42,6 +43,9 @@ pub mod runtime {
         PresentLastDst3dFlags, PresentLastDstLayoutStride, PresentLastDstAttachedBytes,
         PresentLocalCopyOption, LocalCopyLastUs, LocalCopyMaxUs, LocalCopyQueueMax,
         LocalCopyLastSwizzle,
+        LocalCopySubmitFence, LocalCopySubmitEngine, LocalCopySubmitLastCompleted,
+        LocalCopyRunFence, LocalCopyDoneFence, LocalCopyDoneLastCompleted,
+        LocalCopyMapFailSide, LocalCopyMapFailStatus,
         Count,
     }
 
@@ -102,6 +106,7 @@ pub mod runtime {
                 "RtPresentLocalIneligibleBounds", "RtPresentLocalIneligibleDstNotAttached",
                 "RtStdAllocSharedPrimary", "RtStdAllocShadow", "RtStdAllocStaging", "RtStdAllocOther",
                 "RtPresentLocalTaken", "RtPresentLocalMapFail", "RtLocalCopyDone", "RtLocalCopySyncFallback",
+                "RtLocalCopyWake", "RtLocalCopyPublish",
             ];
             const SLOT_NAMES: [&str; Slot::Count as usize] = [
                 "RtPresentLastSrcFormat", "RtPresentLastDstFormat",
@@ -115,8 +120,11 @@ pub mod runtime {
                 "RtPresentLastDst3dFlags", "RtPresentLastDstLayoutStride", "RtPresentLastDstAttachedBytes",
                 "RtPresentLocalCopyOption", "RtLocalCopyLastUs", "RtLocalCopyMaxUs", "RtLocalCopyQueueMax",
                 "RtLocalCopyLastSwizzle",
+                "RtLocalCopySubmitFence", "RtLocalCopySubmitEngine", "RtLocalCopySubmitLastCompleted",
+                "RtLocalCopyRunFence", "RtLocalCopyDoneFence", "RtLocalCopyDoneLastCompleted",
+                "RtLocalCopyMapFailSide", "RtLocalCopyMapFailStatus",
             ];
-            super::record("RuntimeDiagnosticsRevision", 989);
+            super::record("RuntimeDiagnosticsRevision", 991);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
                 super::record(name, counter.load(Ordering::Relaxed));
             }

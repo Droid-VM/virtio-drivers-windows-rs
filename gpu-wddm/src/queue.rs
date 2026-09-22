@@ -1667,9 +1667,12 @@ impl GpuData {
     /// (the handler thread); `notify_fence` orders completion against packets
     /// still in flight on the virtio ring.
     fn run_local_copies(&self) {
+        let mut ran = false;
         loop {
             let job = self.local_copies.lock().pop_front();
             let Some(job) = job else { break; };
+            ran = true;
+            diag::set(Slot::LocalCopyRunFence, job.fence);
             let (t0, freq) = ke_query_performance_counter();
             job.copy.execute();
             let (t1, _) = ke_query_performance_counter();
@@ -1682,7 +1685,24 @@ impl GpuData {
             drop(copy);
             drop(allocations);
             self.notify_dma_completed(engine, fence);
+            diag::set(Slot::LocalCopyDoneFence, fence);
+            diag::set(Slot::LocalCopyDoneLastCompleted, self.engines[engine.node_ordinal() as usize].last_completed_fence.load(Ordering::SeqCst));
         }
+        // Diagnostics builds: republish the counters at most once a second so
+        // they can be read while a client is stuck (publish otherwise needs a
+        // new D3D device).
+        #[cfg(feature = "bringup-diagnostics")]
+        if ran {
+            static LAST_PUBLISH: AtomicU64 = AtomicU64::new(0);
+            let (now, freq) = ke_query_performance_counter();
+            let last = LAST_PUBLISH.load(Ordering::Relaxed);
+            if now.wrapping_sub(last) > freq {
+                LAST_PUBLISH.store(now, Ordering::Relaxed);
+                diag::hit(Stat::LocalCopyPublish);
+                diag::publish();
+            }
+        }
+        let _ = ran;
     }
 
     fn notify_fence(&self, engine: Engine, fence: u32, notify_cb: &dyn Fn(Engine, u32)) {
@@ -2266,7 +2286,11 @@ impl GpuChannel {
     /// DISPATCH_LEVEL. If the queue cannot grow, the copy runs inline rather
     /// than losing the frame or the fence.
     pub fn submit_local_copy(&self, engine: Engine, fence: u32, copy: Box<LocalCopy>, allocations: AllocationsBatch) -> Result<(), NtStatus> {
-        self.data.engines[engine.node_ordinal() as usize].submit(fence);
+        let engine_state = &self.data.engines[engine.node_ordinal() as usize];
+        diag::set(Slot::LocalCopySubmitLastCompleted, engine_state.last_completed_fence.load(Ordering::SeqCst));
+        engine_state.submit(fence);
+        diag::set(Slot::LocalCopySubmitFence, fence);
+        diag::set(Slot::LocalCopySubmitEngine, engine.node_ordinal());
         let job = LocalCopyJob { engine, fence, copy, allocations };
         let queued = {
             let mut queue = self.data.local_copies.lock();
@@ -2698,6 +2722,7 @@ impl QueueHandler {
                     //info!("- new config change");
                 },
                 local_copy => {
+                    diag::hit(Stat::LocalCopyWake);
                     chan.data.run_local_copies();
                 },
                 events.stop => {

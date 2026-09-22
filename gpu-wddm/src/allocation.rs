@@ -42,8 +42,7 @@ use wdk::{
         ke_delay_execution_thread,
         MdlOwned,
         MEMORY_CACHING_TYPE,
-        MM_PHYSICAL_ADDRESS_LIST,
-        PHYSICAL_ADDRESS,
+        PAGE_SIZE,
         mm_map_locked_pages_specify_cache,
         mm_unmap_locked_pages,
     },
@@ -676,22 +675,23 @@ impl Allocation {
                 if let Some(KernelMap(_, ptr)) = &*cache {
                     return Ok(*ptr);
                 }
-                let mut ranges: Vec<MM_PHYSICAL_ADDRESS_LIST> = Vec::new();
+                let mut pfns: Vec<u64> = Vec::new();
                 {
                     let map = map.read();
                     let attached = map.1.iter().fold(0u64, |len, entry| len + entry.length as u64);
                     if attached < *size {
                         return Err(NtStatus(STATUS::DEVICE_NOT_READY));
                     }
-                    ranges.try_reserve_exact(map.1.len())?;
+                    pfns.try_reserve_exact((attached as usize).div_ceil(PAGE_SIZE as usize))?;
                     for entry in map.1.iter() {
-                        ranges.push(MM_PHYSICAL_ADDRESS_LIST {
-                            PhysicalAddress: PHYSICAL_ADDRESS { QuadPart: entry.addr as _ },
-                            NumberOfBytes: entry.length as _,
-                        });
+                        if entry.addr % PAGE_SIZE as u64 != 0 || entry.length % PAGE_SIZE != 0 {
+                            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+                        }
+                        let first = entry.addr / PAGE_SIZE as u64;
+                        pfns.extend((0..(entry.length / PAGE_SIZE) as u64).map(|i| first + i));
                     }
                 }
-                let mdl = MdlOwned::from_physical_ranges(&mut ranges)?;
+                let mdl = MdlOwned::from_locked_pfns(&pfns)?;
                 let ptr = match microseh::try_seh(|| mm_map_locked_pages_specify_cache(
                     &mdl, false, MEMORY_CACHING_TYPE::MmCached, None)) {
                     Ok(Some(ptr)) => ptr,

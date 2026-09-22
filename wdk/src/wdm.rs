@@ -756,6 +756,31 @@ impl MdlOwned {
         Ok(Self(mdl))
     }
 
+    /// One MDL over already-locked system pages given by PFN (e.g. the pages
+    /// dxgkrnl attached to an aperture allocation). Like an MDL from
+    /// MmAllocatePagesForMdlEx it has no VA and MDL_PAGES_LOCKED set, so it can
+    /// be mapped with `mm_map_locked_pages_specify_cache`. The pages stay owned
+    /// by whoever locked them; freeing this MDL (IoFreeMdl) never releases them.
+    /// MmAllocateMdlForIoSpace cannot be used for this: it rejects RAM ranges.
+    pub fn from_locked_pfns(pfns: &[u64]) -> Result<Self, winresult::NtStatus> {
+        if pfns.is_empty() || pfns.len() > (u32::MAX as usize) >> PAGE_SHIFT {
+            return Err(winresult::NtStatus::from(winresult::STATUS::INVALID_PARAMETER));
+        }
+        let size = (pfns.len() << PAGE_SHIFT) as u32;
+        let mdl = unsafe { IoAllocateMdl(null_mut(), size, false as _, false as _, null_mut()) };
+        if mdl.is_null() {
+            return Err(winresult::NtStatus::from(winresult::STATUS::INSUFFICIENT_RESOURCES));
+        }
+        unsafe {
+            (*mdl).MdlFlags |= MDL_PAGES_LOCKED as i16;
+            let array = mm_get_mdl_pfn_array(mdl);
+            for (i, pfn) in pfns.iter().enumerate() {
+                array.add(i).write(*pfn as _);
+            }
+        }
+        Ok(Self(mdl))
+    }
+
     pub fn physical_pages(&self) -> &[u64] {
         MdlRef(self.0).physical_pages()
     }

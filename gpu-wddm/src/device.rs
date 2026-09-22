@@ -489,8 +489,15 @@ impl Device {
         cover_rect: RECT,
         (dx, dy): (i32, i32),
     ) -> Result<Box<LocalCopy>, NtStatus> {
-        let src_base = src_alloc.kernel_address()?;
-        let dst_base = dst_alloc.kernel_address()?;
+        use crate::bringup::runtime::{self as diag, Slot};
+        let src_base = src_alloc.kernel_address().inspect_err(|e| {
+            diag::set(Slot::LocalCopyMapFailSide, 1);
+            diag::set(Slot::LocalCopyMapFailStatus, e.0.to_u32());
+        })?;
+        let dst_base = dst_alloc.kernel_address().inspect_err(|e| {
+            diag::set(Slot::LocalCopyMapFailSide, 2);
+            diag::set(Slot::LocalCopyMapFailStatus, e.0.to_u32());
+        })?;
         let mut rects: SmallVec<[RECT; 4]> = SmallVec::new();
         if dst_subrects.len() > rects.inline_size() {
             rects.push(cover_rect);
