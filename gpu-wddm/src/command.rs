@@ -57,6 +57,84 @@ bitflags! {
     }
 }
 
+/// A blt present executed as an in-guest CPU copy instead of virtio commands
+/// (kmd-blt-present-plan.md). Built in `Device::present` once both surfaces
+/// have a kernel mapping; executed on the PASSIVE queue handler thread after
+/// dxgkrnl submits the packet, so the destination is no longer being read.
+/// Rectangles are in dst space; src pixel = dst pixel + (dx, dy). Every rect
+/// was bounds-checked against both surfaces when this was built.
+pub struct LocalCopy {
+    pub src: Arc<Allocation>,
+    pub dst: Arc<Allocation>,
+    pub src_base: NonNull<u8>,
+    pub dst_base: NonNull<u8>,
+    pub src_stride: u32,
+    pub dst_stride: u32,
+    /// src is RGBA byte order and dst is BGRA (or vice versa): swap R and B.
+    pub swizzle: bool,
+    pub dx: i32,
+    pub dy: i32,
+    pub rects: SmallVec<[RECT; 4]>,
+}
+
+unsafe impl Send for LocalCopy {}
+
+impl core::fmt::Debug for LocalCopy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LocalCopy")
+            .field("src", &self.src.id())
+            .field("dst", &self.dst.id())
+            .field("src_stride", &self.src_stride)
+            .field("dst_stride", &self.dst_stride)
+            .field("swizzle", &self.swizzle)
+            .field("dx", &self.dx)
+            .field("dy", &self.dy)
+            .field("rects", &self.rects)
+            .finish()
+    }
+}
+
+impl LocalCopy {
+    /// Pixels copied (for diagnostics).
+    pub fn pixels(&self) -> u64 {
+        self.rects.iter().map(|r| ((r.right - r.left) as u64) * ((r.bottom - r.top) as u64)).sum()
+    }
+
+    pub fn execute(&self) {
+        for r in &self.rects {
+            let width = (r.right - r.left) as usize;
+            let rows = (r.bottom - r.top) as usize;
+            for row in 0..rows {
+                let sy = (r.top + self.dy) as usize + row;
+                let sx = (r.left + self.dx) as usize;
+                let dy = r.top as usize + row;
+                let dx = r.left as usize;
+                unsafe {
+                    let src = self.src_base.as_ptr().add(sy * self.src_stride as usize + sx * 4);
+                    let dst = self.dst_base.as_ptr().add(dy * self.dst_stride as usize + dx * 4);
+                    if self.swizzle {
+                        Self::copy_swizzled(dst, src, width);
+                    } else {
+                        core::ptr::copy_nonoverlapping(src, dst, width * 4);
+                    }
+                }
+            }
+        }
+    }
+
+    /// RGBA <-> BGRA: swap bytes 0 and 2 of every 32-bit pixel.
+    #[inline]
+    unsafe fn copy_swizzled(dst: *mut u8, src: *const u8, pixels: usize) {
+        let src = src.cast::<u32>();
+        let dst = dst.cast::<u32>();
+        for i in 0..pixels {
+            let v = unsafe { src.add(i).read_unaligned() };
+            let s = (v & 0xff00ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16);
+            unsafe { dst.add(i).write_unaligned(s) };
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Tagged, Debug)]
 #[tagged(VIRTIO_GPU_COMMAND_DMA_PRIVATE_TAG)]
@@ -64,10 +142,13 @@ pub struct CommandDmaPrivate {
     pub tag: u64,
     pub commands: SmallVec<[Command; 3]>,
     pub allocations: SmallVec<[Arc<DeviceSpecificAllocation>; 2]>,
+    /// Present fast path; when set, `commands` is empty and SubmitCommand
+    /// routes the packet to the local-copy queue instead of the virtio ring.
+    pub local_copy: Option<Box<LocalCopy>>,
 }
 
 // Max available space is 128 right now
-const _: () = assert!(size_of::<CommandDmaPrivate>() == 112);
+const _: () = assert!(size_of::<CommandDmaPrivate>() == 120);
 
 impl Default for CommandDmaPrivate {
     fn default() -> Self {
@@ -76,6 +157,7 @@ impl Default for CommandDmaPrivate {
             tag: crate::VIRTIO_GPU_INVALID_TAG,
             commands: SmallVec::new(),
             allocations: SmallVec::new(),
+            local_copy: None,
         }
     }
 }
@@ -86,6 +168,7 @@ impl CommandDmaPrivate {
             tag: VIRTIO_GPU_COMMAND_DMA_PRIVATE_TAG,
             commands: SmallVec::new(),
             allocations: SmallVec::new(),
+            local_copy: None,
         }
     }
 

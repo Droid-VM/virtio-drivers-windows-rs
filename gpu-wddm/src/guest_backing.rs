@@ -87,6 +87,11 @@ pub struct GuestBacking {
     mdl: ManuallyDrop<MdlOwned>,
     entries: Vec<MemEntry>,
     mapping: SpinMutex<Option<(NonNull<u8>, usize)>>,
+    // Contiguous backing already has a kernel VA (pool pointer); the chunked
+    // form gets a lazily created kernel mapping of its MDL for the present
+    // local-copy path. Unmapped in Drop before the pages go away.
+    kernel_va: Option<NonNull<u8>>,
+    kernel_map: SpinMutex<Option<NonNull<u8>>>,
 }
 unsafe impl Send for GuestBacking {}
 unsafe impl Sync for GuestBacking {}
@@ -135,7 +140,8 @@ impl GuestBacking {
         unsafe { MmBuildMdlForNonPagedPool(mdl); }
         let mut backing = Self { allocation: Some(raw), physical: physical + offset as u64,
             size: size as u32, mdl: ManuallyDrop::new(MdlOwned(mdl)),
-            entries: Vec::new(), mapping: SpinMutex::new(None) };
+            entries: Vec::new(), mapping: SpinMutex::new(None),
+            kernel_va: NonNull::new(ptr), kernel_map: SpinMutex::new(None) };
         backing.entries.try_reserve_exact(1)?;
         backing.entries.push(MemEntry { addr: backing.physical, length: backing.size, _padding: 0 });
         backing.record_success();
@@ -173,7 +179,8 @@ impl GuestBacking {
         // contiguous kernel VA mapping or manual PFN construction is needed.
         let mut backing = Self { allocation: None, physical: 0, size: size as u32,
             mdl: ManuallyDrop::new(MdlOwned(mdl)), entries: Vec::new(),
-            mapping: SpinMutex::new(None) };
+            mapping: SpinMutex::new(None),
+            kernel_va: None, kernel_map: SpinMutex::new(None) };
         if unsafe { (*mdl).ByteCount as u64 != size || (*mdl).ByteOffset != 0 } {
             return Err(NtStatus(STATUS::INVALID_DEVICE_STATE));
         }
@@ -199,6 +206,21 @@ impl GuestBacking {
     }
 
     pub fn entries(&self) -> &[MemEntry] { &self.entries }
+
+    /// Kernel-mode VA of the whole backing (cached). IRQL <= DISPATCH_LEVEL.
+    pub fn kernel_address(&self) -> Result<NonNull<u8>, NtStatus> {
+        if let Some(ptr) = self.kernel_va { return Ok(ptr); }
+        let mut map = self.kernel_map.lock();
+        if let Some(ptr) = *map { return Ok(ptr); }
+        let ptr = match microseh::try_seh(|| mm_map_locked_pages_specify_cache(
+            &self.mdl, false, MEMORY_CACHING_TYPE::MmCached, None)) {
+            Ok(Some(ptr)) => ptr,
+            Ok(None) => return Err(NtStatus(STATUS::NO_MEMORY)),
+            Err(e) => return Err(e.into()),
+        };
+        *map = Some(ptr);
+        Ok(ptr)
+    }
 
     pub fn map(&self) -> Result<NonNull<u8>, NtStatus> {
         let mut mapping = self.mapping.lock();
@@ -229,6 +251,11 @@ impl GuestBacking {
 
 impl Drop for GuestBacking {
     fn drop(&mut self) {
+        // Kernel mappings are process-independent; drop them first so neither
+        // the immediate free nor the deferred retirement leaves a live VA.
+        if let Some(ptr) = self.kernel_map.get_mut().take() {
+            mm_unmap_locked_pages(&self.mdl, ptr);
+        }
         if let Some((ptr, process)) = self.mapping.get_mut().take() {
             if process == unsafe { IoGetCurrentProcess() as usize }
                 && unsafe { KeGetCurrentIrql() } as u32 <= APC_LEVEL

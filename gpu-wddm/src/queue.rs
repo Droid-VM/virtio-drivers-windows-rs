@@ -85,7 +85,7 @@ use spin::{
 };
 
 use crate::adapter::*;
-use crate::bringup::runtime::{self as diag, Stat};
+use crate::bringup::runtime::{self as diag, Slot, Stat};
 use crate::uapi::*;
 use crate::allocation::*;
 use crate::command::{*, Command};
@@ -1618,6 +1618,19 @@ struct GpuData {
     fence_submissions: SpinMutex<SmallVec<[FenceSubmission; 16]>>,
 
     engines: [EngineState; Engine::TOTAL_COUNT as usize],
+
+    // Blt present fast path (kmd-blt-present-plan.md): packets whose DMA is an
+    // in-guest copy. Pushed at DISPATCH_LEVEL from SubmitCommand, drained on
+    // the PASSIVE handler thread, which completes their fences.
+    local_copies: SpinMutex<VecDeque<LocalCopyJob>>,
+    local_copy_event: Pin<Arc<KeEvent>>,
+}
+
+struct LocalCopyJob {
+    engine: Engine,
+    fence: u32,
+    copy: Box<LocalCopy>,
+    allocations: AllocationsBatch,
 }
 
 impl GpuData {
@@ -1645,7 +1658,31 @@ impl GpuData {
                 last_completed_timestamp: AtomicU64::new(0),
             }),
             fence_submissions: SpinMutex::new(SmallVec::new()),
+            local_copies: SpinMutex::new(VecDeque::new()),
+            local_copy_event: Arc::pin_init(KeEvent::new(EventType::Synchronization, false))?,
         }? NtStatus)
+    }
+
+    /// Run every queued present copy, then complete its fence. PASSIVE_LEVEL
+    /// (the handler thread); `notify_fence` orders completion against packets
+    /// still in flight on the virtio ring.
+    fn run_local_copies(&self) {
+        loop {
+            let job = self.local_copies.lock().pop_front();
+            let Some(job) = job else { break; };
+            let (t0, freq) = ke_query_performance_counter();
+            job.copy.execute();
+            let (t1, _) = ke_query_performance_counter();
+            let us = ((t1.wrapping_sub(t0)) * 1_000_000 / freq.max(1)) as u32;
+            diag::set(Slot::LocalCopyLastUs, us);
+            diag::set_max(Slot::LocalCopyMaxUs, us);
+            diag::set(Slot::LocalCopyLastSwizzle, job.copy.swizzle as u32);
+            diag::hit(Stat::LocalCopyDone);
+            let LocalCopyJob { engine, fence, copy, allocations } = job;
+            drop(copy);
+            drop(allocations);
+            self.notify_dma_completed(engine, fence);
+        }
     }
 
     fn notify_fence(&self, engine: Engine, fence: u32, notify_cb: &dyn Fn(Engine, u32)) {
@@ -2225,6 +2262,37 @@ impl GpuChannel {
         }
     }
 
+    /// Queue a blt present that executes as a CPU copy (see `LocalCopy`).
+    /// DISPATCH_LEVEL. If the queue cannot grow, the copy runs inline rather
+    /// than losing the frame or the fence.
+    pub fn submit_local_copy(&self, engine: Engine, fence: u32, copy: Box<LocalCopy>, allocations: AllocationsBatch) -> Result<(), NtStatus> {
+        self.data.engines[engine.node_ordinal() as usize].submit(fence);
+        let job = LocalCopyJob { engine, fence, copy, allocations };
+        let queued = {
+            let mut queue = self.data.local_copies.lock();
+            if queue.try_reserve(1).is_ok() {
+                queue.push_back(job);
+                diag::set_max(Slot::LocalCopyQueueMax, queue.len() as u32);
+                None
+            } else {
+                Some(job)
+            }
+        };
+        match queued {
+            None => {
+                self.data.local_copy_event.set();
+            },
+            Some(job) => {
+                diag::hit(Stat::LocalCopySyncFallback);
+                job.copy.execute();
+                drop(job.copy);
+                drop(job.allocations);
+                self.data.notify_dma_completed(engine, fence);
+            },
+        }
+        Ok(())
+    }
+
     pub fn submit_preemption(&self, engine: Engine, preemption_fence: u32) {
         self.data.engines[engine.node_ordinal() as usize].last_preemption_fence.store(preemption_fence, Ordering::SeqCst);
     }
@@ -2588,6 +2656,7 @@ impl QueueHandler {
         let control_msg = chan.control.get_queue_event();
         let cursor_msg = chan.cursor.get_queue_event();
         let events = self.thread.events();
+        let local_copy = chan.data.local_copy_event.as_ref();
 
         //let last_completed_fence = &self.last_completed_fence;
         //let fence_queue = &self.fence_queue;
@@ -2628,6 +2697,9 @@ impl QueueHandler {
                     // TODO
                     //info!("- new config change");
                 },
+                local_copy => {
+                    chan.data.run_local_copies();
+                },
                 events.stop => {
                     info!("- stopping thread");
                     return;
@@ -2642,6 +2714,7 @@ impl QueueHandler {
                     self.control.handle_responses(&chan.data);
                     self.control.handle_requests(&mut self.pci_transport);
                     self.cursor.handle_responses(&chan.data);
+                    chan.data.run_local_copies();
                 };
                 error(e) => {
                     error!("{}: error: {:?}", function!(), e);

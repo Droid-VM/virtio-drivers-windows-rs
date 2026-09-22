@@ -19,9 +19,11 @@ pub mod runtime {
         PresentLocalIneligibleFlags, PresentLocalIneligibleNotGuestBlob,
         PresentLocalIneligibleNoInfo, PresentLocalIneligibleTiled,
         PresentLocalIneligibleStride, PresentLocalIneligibleFormatUnsupported,
-        PresentLocalIneligibleFormatMismatch, PresentLocalIneligibleScaled,
+        PresentLocalIneligibleScaled,
         PresentLocalIneligibleBounds, PresentLocalIneligibleDstNotAttached,
         StdAllocSharedPrimary, StdAllocShadow, StdAllocStaging, StdAllocOther,
+        // P1: fast path actually taken / mapping failed (fell back) / copies run.
+        PresentLocalTaken, PresentLocalMapFail, LocalCopyDone, LocalCopySyncFallback,
         Count,
     }
 
@@ -38,6 +40,8 @@ pub mod runtime {
         /// 1 = guest blob, 2 = classic 3D (standard allocation), 0 = other.
         PresentLastSrcKind, PresentLastDstKind,
         PresentLastDst3dFlags, PresentLastDstLayoutStride, PresentLastDstAttachedBytes,
+        PresentLocalCopyOption, LocalCopyLastUs, LocalCopyMaxUs, LocalCopyQueueMax,
+        LocalCopyLastSwizzle,
         Count,
     }
 
@@ -65,6 +69,12 @@ pub mod runtime {
         SLOTS[slot as usize].store(value, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub fn set_max(slot: Slot, value: u32) {
+        #[cfg(feature = "bringup-diagnostics")]
+        SLOTS[slot as usize].fetch_max(value, Ordering::Relaxed);
+    }
+
     /// phase: 0 submitted, 1 response callback, 2 notify returned successfully.
     #[inline]
     pub fn fence(phase: usize, node: u32, value: u32) {
@@ -88,9 +98,10 @@ pub mod runtime {
                 "RtPresentLocalIneligibleFlags", "RtPresentLocalIneligibleNotGuestBlob",
                 "RtPresentLocalIneligibleNoInfo", "RtPresentLocalIneligibleTiled",
                 "RtPresentLocalIneligibleStride", "RtPresentLocalIneligibleFormatUnsupported",
-                "RtPresentLocalIneligibleFormatMismatch", "RtPresentLocalIneligibleScaled",
+                "RtPresentLocalIneligibleScaled",
                 "RtPresentLocalIneligibleBounds", "RtPresentLocalIneligibleDstNotAttached",
                 "RtStdAllocSharedPrimary", "RtStdAllocShadow", "RtStdAllocStaging", "RtStdAllocOther",
+                "RtPresentLocalTaken", "RtPresentLocalMapFail", "RtLocalCopyDone", "RtLocalCopySyncFallback",
             ];
             const SLOT_NAMES: [&str; Slot::Count as usize] = [
                 "RtPresentLastSrcFormat", "RtPresentLastDstFormat",
@@ -102,8 +113,10 @@ pub mod runtime {
                 "RtPresentLastSrcBlobMem", "RtPresentLastDstBlobMem",
                 "RtPresentLastSrcKind", "RtPresentLastDstKind",
                 "RtPresentLastDst3dFlags", "RtPresentLastDstLayoutStride", "RtPresentLastDstAttachedBytes",
+                "RtPresentLocalCopyOption", "RtLocalCopyLastUs", "RtLocalCopyMaxUs", "RtLocalCopyQueueMax",
+                "RtLocalCopyLastSwizzle",
             ];
-            super::record("RuntimeDiagnosticsRevision", 987);
+            super::record("RuntimeDiagnosticsRevision", 989);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
                 super::record(name, counter.load(Ordering::Relaxed));
             }
@@ -120,6 +133,43 @@ pub mod runtime {
             }
         }
     }
+}
+
+/// Read a REG_DWORD from `Services\VirtioGpu\Parameters`. PASSIVE_LEVEL only
+/// (returns None otherwise); the key is optional, so a missing value is None.
+pub fn read_parameter(name: &str) -> Option<u32> {
+    use core::{mem::zeroed, ptr::null_mut};
+    use wdk::wdm::*;
+    if unsafe { KeGetCurrentIrql() } != 0 { return None; }
+    let mut path: alloc::vec::Vec<u16> = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\VirtioGpu\\Parameters".encode_utf16().collect();
+    let mut key_name = UNICODE_STRING {
+        Length: (path.len() * 2) as u16,
+        MaximumLength: (path.len() * 2) as u16,
+        Buffer: path.as_mut_ptr(),
+    };
+    let mut attrs: OBJECT_ATTRIBUTES = unsafe { zeroed() };
+    attrs.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+    attrs.ObjectName = &mut key_name;
+    attrs.Attributes = OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE;
+    let mut handle = null_mut();
+    let status = unsafe { ZwOpenKey(&mut handle, KEY_QUERY_VALUE, &mut attrs) };
+    if (status as i32) < 0 { return None; }
+    let mut name_buf: alloc::vec::Vec<u16> = name.encode_utf16().collect();
+    let mut value_name = UNICODE_STRING {
+        Length: (name_buf.len() * 2) as u16,
+        MaximumLength: (name_buf.len() * 2) as u16,
+        Buffer: name_buf.as_mut_ptr(),
+    };
+    // KEY_VALUE_PARTIAL_INFORMATION: TitleIndex, Type, DataLength, Data[]
+    let mut buf = [0u32; 8];
+    let mut result_len = 0u32;
+    let status = unsafe {
+        ZwQueryValueKey(handle, &mut value_name, KEY_VALUE_INFORMATION_CLASS::KeyValuePartialInformation,
+                        buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &mut result_len)
+    };
+    unsafe { ZwClose(handle); }
+    if (status as i32) < 0 || buf[1] != REG_DWORD || buf[2] < 4 { return None; }
+    Some(buf[3])
 }
 
 #[cfg(not(feature = "bringup-diagnostics"))]

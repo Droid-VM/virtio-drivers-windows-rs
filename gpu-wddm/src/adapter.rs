@@ -1136,6 +1136,16 @@ impl Adapter {
         crate::bringup::record("StartStage", 1);
         trace!("{}", function!());
 
+        {
+            use crate::bringup::runtime::{self as diag, Slot};
+            let option = crate::bringup::read_parameter("PresentLocalCopy").unwrap_or(1);
+            crate::device::set_present_local_copy(option != 0);
+            diag::set(Slot::PresentLocalCopyOption, option);
+            if option == 0 {
+                warn!("{}: PresentLocalCopy disabled by registry", function!());
+            }
+        }
+
         // TODO: write registry info
 
         //info!("Num dma queue entries = {}, luid = ({}, {})", start_info.RequiredDmaQueueEntry, start_info.AdapterLuid.LowPart, start_info.AdapterLuid.HighPart);
@@ -2122,9 +2132,9 @@ impl Adapter {
             //}
         };
 
-        let (commands, allocations) = if let Some(dma_priv) = <CommandDmaPrivate as TaggedExt>::from_handle_silent_mut(priv_ptr) {
-            let CommandDmaPrivate {commands, allocations, ..} = core::mem::take(dma_priv);
-            (commands, allocations)
+        let (commands, allocations, local_copy) = if let Some(dma_priv) = <CommandDmaPrivate as TaggedExt>::from_handle_silent_mut(priv_ptr) {
+            let CommandDmaPrivate {commands, allocations, local_copy, ..} = core::mem::take(dma_priv);
+            (commands, allocations, local_copy)
         } else {
             if !submit_command.Flags.Paging() {
                 error!("{}: invalid dma private data for submit {:?}", function!(), submit_command);
@@ -2134,6 +2144,12 @@ impl Adapter {
         };
 
         trace!("{}: engine {:?} total {} commands: {:?}, allocations: {:?}", function!(), engine, commands.len(), commands, allocations);
+
+        if let Some(copy) = local_copy {
+            // Blt present fast path: no virtio traffic, the copy runs on the
+            // PASSIVE queue handler thread and completes the fence itself.
+            return chan.submit_local_copy(engine, fence, copy, AllocationsBatch::new(allocations));
+        }
 
         //for cmd in &commands {
         //    if cmd.id == CommandId::MapBlob {

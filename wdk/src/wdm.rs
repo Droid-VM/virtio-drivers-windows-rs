@@ -744,6 +744,18 @@ impl MdlOwned {
 
         Ok(Self(mdl))
     }
+    /// One MDL over several physical ranges (page-aligned, page-multiple),
+    /// e.g. the coalesced page list dxgkrnl handed over for an aperture
+    /// allocation. The result can be mapped with `mm_map_locked_pages_specify_cache`.
+    pub fn from_physical_ranges(ranges: &mut [MM_PHYSICAL_ADDRESS_LIST]) -> Result<Self, winresult::NtStatus> {
+        if ranges.is_empty() {
+            return Err(winresult::NtStatus::from(winresult::STATUS::INVALID_PARAMETER));
+        }
+        let mut mdl = null_mut();
+        wdm_call_status!(<= DISPATCH_LEVEL | MmAllocateMdlForIoSpace(ranges.as_mut_ptr(), ranges.len() as _, &mut mdl as _))?;
+        Ok(Self(mdl))
+    }
+
     pub fn physical_pages(&self) -> &[u64] {
         MdlRef(self.0).physical_pages()
     }

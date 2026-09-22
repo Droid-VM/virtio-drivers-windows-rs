@@ -37,12 +37,32 @@ use crate::{
     slice_from_raw_parts,
     slice_from_raw_parts_mut,
 };
+use smallvec::SmallVec;
 use crate::uapi::*;
 use crate::adapter::*;
 use crate::queue::*;
 use crate::command::*;
 use crate::allocation::*;
 use crate::virgl::*;
+
+/// Registry `Services\VirtioGpu\Parameters\PresentLocalCopy` (REG_DWORD, default 1):
+/// 0 forces every blt present through the virgl sequence.
+static PRESENT_LOCAL_COPY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub fn present_local_copy_enabled() -> bool {
+    PRESENT_LOCAL_COPY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_present_local_copy(enabled: bool) {
+    PRESENT_LOCAL_COPY.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Output of the present fast-path admission check.
+struct LocalCopyParams {
+    src_stride: u32,
+    dst_stride: u32,
+    swizzle: bool,
+}
 
 const VIRTIO_GPU_DEVICE_TAG: u64 = u64::from_ne_bytes(*b"VGPUDEVI");
 const VIRTIO_GPU_CONTEXT_TAG: u64 = u64::from_ne_bytes(*b"VGPUDCTX");
@@ -335,10 +355,10 @@ impl Device {
         dst_subrects: &[RECT],
         cover_rect: &RECT,
         (dx, dy): (i32, i32),
-    ) -> Result<(), crate::bringup::runtime::Stat> {
+    ) -> Result<LocalCopyParams, crate::bringup::runtime::Stat> {
         use crate::bringup::runtime::{self as diag, Slot, Stat};
 
-        struct Surface { format: u32, stride: u32, width: u32, height: u32, modifier: u64 }
+        struct Surface { format: u32, stride: u32, width: u32, height: u32, modifier: u64, size: u64 }
 
         fn surface_of(alloc: &Allocation, is_dst: bool) -> Result<Surface, Stat> {
             let (kind_slot, mem_slot) = if is_dst {
@@ -357,7 +377,7 @@ impl Device {
                         return Err(Stat::PresentLocalIneligibleNoInfo);
                     };
                     // Packed struct: copy fields out before use.
-                    Ok(Surface { format: info.format, stride: info.strides[0], width: info.width, height: info.height, modifier: info.modifier })
+                    Ok(Surface { format: info.format, stride: info.strides[0], width: info.width, height: info.height, modifier: info.modifier, size: alloc.size() as u64 })
                 },
                 VirtioResource::_3D { format, flags, width, height, layout, .. } => {
                     diag::set(kind_slot, 2);
@@ -380,17 +400,21 @@ impl Device {
                     if attached < alloc.size() {
                         return Err(Stat::PresentLocalIneligibleDstNotAttached);
                     }
-                    Ok(Surface { format: (*format).into(), stride, width: *width, height: *height, modifier })
+                    Ok(Surface { format: (*format).into(), stride, width: *width, height: *height, modifier, size: alloc.size() as u64 })
                 },
             }
         }
 
-        fn is_4bpp(format: u32) -> bool {
-            matches!(format,
+        /// Some(true) for BGRA byte order, Some(false) for RGBA, None if not a
+        /// supported 32-bit format. Alpha vs X is irrelevant for the copy.
+        fn bgra_order(format: u32) -> Option<bool> {
+            match format {
                 VIRGL_FORMAT_B8G8R8A8_UNORM | VIRGL_FORMAT_B8G8R8X8_UNORM |
+                VIRGL_FORMAT_B8G8R8A8_SRGB  | VIRGL_FORMAT_B8G8R8X8_SRGB => Some(true),
                 VIRGL_FORMAT_R8G8B8A8_UNORM | VIRGL_FORMAT_R8G8B8X8_UNORM |
-                VIRGL_FORMAT_B8G8R8A8_SRGB  | VIRGL_FORMAT_B8G8R8X8_SRGB  |
-                VIRGL_FORMAT_R8G8B8A8_SRGB)
+                VIRGL_FORMAT_R8G8B8A8_SRGB => Some(false),
+                _ => None,
+            }
         }
 
         fn inside(r: &RECT, width: u32, height: u32) -> bool {
@@ -427,11 +451,13 @@ impl Device {
         if src.stride == 0 || dst.stride == 0 {
             return Err(Stat::PresentLocalIneligibleStride);
         }
-        if !is_4bpp(src.format) || !is_4bpp(dst.format) {
+        let (Some(src_bgra), Some(dst_bgra)) = (bgra_order(src.format), bgra_order(dst.format)) else {
             return Err(Stat::PresentLocalIneligibleFormatUnsupported);
-        }
-        if src.format != dst.format {
-            return Err(Stat::PresentLocalIneligibleFormatMismatch);
+        };
+        // The whole image must fit the backing at the advertised stride.
+        if (src.height as u64 - 1) * src.stride as u64 + src.width as u64 * 4 > src.size ||
+            (dst.height as u64 - 1) * dst.stride as u64 + dst.width as u64 * 4 > dst.size {
+            return Err(Stat::PresentLocalIneligibleBounds);
         }
 
         let src_rect = present.SrcRect;
@@ -450,7 +476,40 @@ impl Device {
             diag::hit(Stat::PresentLocalManySubRects);
         }
 
-        Ok(())
+        Ok(LocalCopyParams { src_stride: src.stride, dst_stride: dst.stride, swizzle: src_bgra != dst_bgra })
+    }
+
+    /// Map both surfaces and build the packet's local-copy job. Errors mean
+    /// "fall back to the virgl sequence for this present".
+    fn build_local_copy(
+        src_alloc: &Arc<Allocation>,
+        dst_alloc: &Arc<Allocation>,
+        params: LocalCopyParams,
+        dst_subrects: &[RECT],
+        cover_rect: RECT,
+        (dx, dy): (i32, i32),
+    ) -> Result<Box<LocalCopy>, NtStatus> {
+        let src_base = src_alloc.kernel_address()?;
+        let dst_base = dst_alloc.kernel_address()?;
+        let mut rects: SmallVec<[RECT; 4]> = SmallVec::new();
+        if dst_subrects.len() > rects.inline_size() {
+            rects.push(cover_rect);
+        } else {
+            rects.extend_from_slice(dst_subrects);
+        }
+        let copy = Box::try_new(LocalCopy {
+            src: src_alloc.clone(),
+            dst: dst_alloc.clone(),
+            src_base,
+            dst_base,
+            src_stride: params.src_stride,
+            dst_stride: params.dst_stride,
+            swizzle: params.swizzle,
+            dx,
+            dy,
+            rects,
+        })?;
+        Ok(copy)
     }
 
     pub fn present(&self, present: &mut DXGKARG_PRESENT) -> Result<(), NtStatus> {
@@ -542,13 +601,60 @@ impl Device {
         let dx = present.SrcRect.left - present.DstRect.left;
         let dy = present.SrcRect.top  - present.DstRect.top;
 
-        // kmd-blt-present-plan.md P0: classify only, behavior is unchanged.
+        if (present.DmaBufferPrivateDataSize as usize) < size_of::<CommandDmaPrivate>() {
+            error!("{}: no dma private data (not enough space: {} < size_of::<CommandDmaPrivate>())", function!(), present.DmaBufferPrivateDataSize);
+            return Err(NtStatus(STATUS::GRAPHICS_INSUFFICIENT_DMA_BUFFER));
+        }
+
+        if present.pDmaBufferPrivateData.is_null() {
+            error!("{}: no dma private data", function!());
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+
+        // kmd-blt-present-plan.md: blt present as an in-guest copy when both
+        // surfaces are linear and CPU-reachable; otherwise the virgl sequence.
         {
             use crate::bringup::runtime::{self as diag, Stat};
             diag::hit(Stat::PresentEnter);
-            match Self::present_local_copy_eligible(&src_alloc, &dst_alloc, present, dst_subrects, &cover_rect, (dx, dy)) {
-                Ok(()) => diag::hit(Stat::PresentLocalEligible),
-                Err(reason) => diag::hit(reason),
+            let eligible = Self::present_local_copy_eligible(&src_alloc, &dst_alloc, present, dst_subrects, &cover_rect, (dx, dy));
+            match &eligible {
+                Ok(_) => diag::hit(Stat::PresentLocalEligible),
+                Err(reason) => diag::hit(*reason),
+            }
+            if let Ok(params) = eligible && present_local_copy_enabled() {
+                match Self::build_local_copy(&src_alloc, &dst_alloc, params, dst_subrects, cover_rect, (dx, dy)) {
+                    Ok(copy) => {
+                        // dxgkrnl only submits a packet with DMA content; the
+                        // bytes themselves are never interpreted for this path.
+                        const MARKER: usize = 64;
+                        if dmabuf.len() < MARKER {
+                            error!("{}: local copy marker needs {} bytes, but only {} bytes are available", function!(), MARKER, dmabuf.len());
+                            present.pDmaBuffer = unsafe { present.pDmaBuffer.byte_add(MARKER) };
+                            return Err(NtStatus(STATUS::GRAPHICS_INSUFFICIENT_DMA_BUFFER))
+                        }
+                        dmabuf[..MARKER].fill(0);
+                        present.pDmaBuffer = unsafe { present.pDmaBuffer.byte_add(MARKER) };
+
+                        diag::hit(Stat::PresentLocalTaken);
+                        dst_alloc.mark_busy();
+                        src_alloc.mark_busy();
+                        dma_priv.attach_allocation(src);
+                        dma_priv.attach_allocation(dst);
+                        dma_priv.local_copy = Some(copy);
+
+                        unsafe {
+                            let dma_priv_ptr = transmute::<_, *mut CommandDmaPrivate>(present.pDmaBufferPrivateData);
+                            dma_priv_ptr.write(dma_priv);
+                            present.pDmaBufferPrivateData = present.pDmaBufferPrivateData.byte_add(size_of::<CommandDmaPrivate>());
+                            present.DmaBufferPrivateDataSize -= size_of::<CommandDmaPrivate>() as u32;
+                        };
+                        return Ok(());
+                    },
+                    Err(status) => {
+                        diag::hit(Stat::PresentLocalMapFail);
+                        warn!("{}: local copy mapping failed ({:?}), using virgl blit: src {:?} dst {:?}", function!(), status, src_alloc, dst_alloc);
+                    },
+                }
             }
         }
 
@@ -684,16 +790,6 @@ impl Device {
         }
 
         present.pDmaBuffer = unsafe { present.pDmaBuffer.byte_add(dmabuf_offset) };
-
-        if (present.DmaBufferPrivateDataSize as usize) < size_of::<CommandDmaPrivate>() {
-            error!("{}: no dma private data (not enough space: {} < size_of::<CommandDmaPrivate>())", function!(), present.DmaBufferPrivateDataSize);
-            return Err(NtStatus(STATUS::GRAPHICS_INSUFFICIENT_DMA_BUFFER));
-        }
-
-        if present.pDmaBufferPrivateData.is_null() {
-            error!("{}: no dma private data", function!());
-            return Err(NtStatus(STATUS::INVALID_PARAMETER));
-        }
 
         dst_alloc.mark_busy();
         src_alloc.mark_busy();

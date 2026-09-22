@@ -40,6 +40,12 @@ use wdk::{
         KeEvent,
         NtTime,
         ke_delay_execution_thread,
+        MdlOwned,
+        MEMORY_CACHING_TYPE,
+        MM_PHYSICAL_ADDRESS_LIST,
+        PHYSICAL_ADDRESS,
+        mm_map_locked_pages_specify_cache,
+        mm_unmap_locked_pages,
     },
     dxgkrnl::{
         D3DDDIFORMAT,
@@ -593,6 +599,19 @@ pub struct Allocation {
     sync: RwLock<Vec<NonNull<KeEvent>>>,
     device_specific: SpinMutex<BTreeMap<NonZero<u32>, Weak<DeviceSpecificAllocation>>>,
     cmd: SpinMutex<Option<AlignedBox<[u8]>>>, // This probably can just be an AtomicOptionBox
+    // Classic 3D resources only: kernel mapping of the aperture pages dxgkrnl
+    // attached, built lazily for the present local-copy path over the coalesced
+    // `MemEntry` list (the paging MDL is not ours to keep). Blobs use
+    // GuestBacking::kernel_address instead.
+    kernel_map: SpinMutex<Option<KernelMap>>,
+}
+
+struct KernelMap(MdlOwned, NonNull<u8>);
+
+impl core::fmt::Debug for KernelMap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "KernelMap({:p})", self.1.as_ptr())
+    }
 }
 
 const _:() = assert!(size_of::<Allocation>() <= 512);
@@ -637,7 +656,52 @@ impl Allocation {
             //device_specific: SpinMutex::new(Vec::new()),
             device_specific: SpinMutex::new(BTreeMap::new()),
             cmd: SpinMutex::new(cmd),
+            kernel_map: SpinMutex::new(None),
         })
+    }
+
+    /// Kernel-mode VA covering the whole allocation, for the present local-copy
+    /// path. Blob: the guest backing. 3D: every attached page must be present
+    /// (`total_attached_bytes() >= size()`), mapped once and cached until the
+    /// allocation is destroyed. This driver never detaches aperture pages, so
+    /// the mapping cannot go stale while the allocation lives.
+    pub fn kernel_address(&self) -> Result<NonNull<u8>, NtStatus> {
+        match &self.resource {
+            VirtioResource::Blob { .. } => {
+                let backing = self.guest_backing.as_ref().ok_or(NtStatus(STATUS::INVALID_PARAMETER))?;
+                backing.kernel_address()
+            },
+            VirtioResource::_3D { map, size, .. } => {
+                let mut cache = self.kernel_map.lock();
+                if let Some(KernelMap(_, ptr)) = &*cache {
+                    return Ok(*ptr);
+                }
+                let mut ranges: Vec<MM_PHYSICAL_ADDRESS_LIST> = Vec::new();
+                {
+                    let map = map.read();
+                    let attached = map.1.iter().fold(0u64, |len, entry| len + entry.length as u64);
+                    if attached < *size {
+                        return Err(NtStatus(STATUS::DEVICE_NOT_READY));
+                    }
+                    ranges.try_reserve_exact(map.1.len())?;
+                    for entry in map.1.iter() {
+                        ranges.push(MM_PHYSICAL_ADDRESS_LIST {
+                            PhysicalAddress: PHYSICAL_ADDRESS { QuadPart: entry.addr as _ },
+                            NumberOfBytes: entry.length as _,
+                        });
+                    }
+                }
+                let mdl = MdlOwned::from_physical_ranges(&mut ranges)?;
+                let ptr = match microseh::try_seh(|| mm_map_locked_pages_specify_cache(
+                    &mdl, false, MEMORY_CACHING_TYPE::MmCached, None)) {
+                    Ok(Some(ptr)) => ptr,
+                    Ok(None) => return Err(NtStatus(STATUS::NO_MEMORY)),
+                    Err(e) => return Err(e.into()),
+                };
+                *cache = Some(KernelMap(mdl, ptr));
+                Ok(ptr)
+            },
+        }
     }
 
     pub fn guest_backing(&self) -> Option<&crate::guest_backing::GuestBacking> {
@@ -1218,6 +1282,10 @@ impl Allocation {
 impl Drop for Allocation {
     fn drop(&mut self) {
         self.tag = 0;
+        if let Some(KernelMap(mdl, ptr)) = self.kernel_map.get_mut().take() {
+            mm_unmap_locked_pages(&mdl, ptr);
+            drop(mdl);
+        }
     }
 }
 
