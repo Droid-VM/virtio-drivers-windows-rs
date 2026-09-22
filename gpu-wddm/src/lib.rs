@@ -874,6 +874,16 @@ unsafe extern "C" fn get_standard_allocation_driver_data(adapter: HANDLE, standa
         return STATUS::SUCCESS.to_u32();
     }
 
+    {
+        use crate::bringup::runtime::{self as diag, Stat};
+        diag::hit(match standard_allocation.StandardAllocationType {
+            D3DKMDT_STANDARDALLOCATION_TYPE::D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => Stat::StdAllocSharedPrimary,
+            D3DKMDT_STANDARDALLOCATION_TYPE::D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE => Stat::StdAllocShadow,
+            D3DKMDT_STANDARDALLOCATION_TYPE::D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE => Stat::StdAllocStaging,
+            _ => Stat::StdAllocOther,
+        });
+    }
+
     let mut refresh_rate = D3DDDI_RATIONAL { Numerator: 0, Denominator: 0 };
     let (width, height, size, format, flags) = match standard_allocation.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_TYPE::D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {

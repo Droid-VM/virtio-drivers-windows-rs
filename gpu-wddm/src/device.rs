@@ -321,8 +321,10 @@ impl Device {
     }
 
     /// Fast-path admission for a blt present done by an in-guest memcpy
-    /// (kmd-blt-present-plan.md §1.1). Both allocations must be linear,
-    /// guest-backed blobs of the same 4-byte format, with no scaling and every
+    /// (kmd-blt-present-plan.md §1.1). src must be a linear guest-backed blob;
+    /// dst is either such a blob or a MAP_COHERENT classic 3D resource (the
+    /// shadow/staging standard allocations dxgkrnl creates for redirection)
+    /// whose system pages are attached. Same 4-byte format, no scaling, every
     /// sub-rectangle inside both images. Returns the first failed check as the
     /// diagnostic counter to bump. Pure: touches no state beyond the last-seen
     /// diagnostic slots.
@@ -336,18 +338,51 @@ impl Device {
     ) -> Result<(), crate::bringup::runtime::Stat> {
         use crate::bringup::runtime::{self as diag, Slot, Stat};
 
-        fn blob_of(alloc: &Allocation, mem_slot: Slot) -> Result<BlobInfo, Stat> {
-            let VirtioResource::Blob { mem, info, .. } = alloc.resource() else {
-                return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+        struct Surface { format: u32, stride: u32, width: u32, height: u32, modifier: u64 }
+
+        fn surface_of(alloc: &Allocation, is_dst: bool) -> Result<Surface, Stat> {
+            let (kind_slot, mem_slot) = if is_dst {
+                (Slot::PresentLastDstKind, Slot::PresentLastDstBlobMem)
+            } else {
+                (Slot::PresentLastSrcKind, Slot::PresentLastSrcBlobMem)
             };
-            diag::set(mem_slot, mem.bits());
-            if !mem.contains(BlobMem::GUEST) || alloc.guest_backing().is_none() {
-                return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+            match alloc.resource() {
+                VirtioResource::Blob { mem, info, .. } => {
+                    diag::set(kind_slot, 1);
+                    diag::set(mem_slot, mem.bits());
+                    if !mem.contains(BlobMem::GUEST) || alloc.guest_backing().is_none() {
+                        return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+                    }
+                    let Some(info) = *info.read() else {
+                        return Err(Stat::PresentLocalIneligibleNoInfo);
+                    };
+                    // Packed struct: copy fields out before use.
+                    Ok(Surface { format: info.format, stride: info.strides[0], width: info.width, height: info.height, modifier: info.modifier })
+                },
+                VirtioResource::_3D { format, flags, width, height, layout, .. } => {
+                    diag::set(kind_slot, 2);
+                    if !is_dst {
+                        return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+                    }
+                    diag::set(Slot::PresentLastDst3dFlags, flags.bits());
+                    let attached = alloc.total_attached_bytes();
+                    diag::set(Slot::PresentLastDstAttachedBytes, attached as u32);
+                    // A queried layout means a GPU client imported this surface
+                    // (UMD OpenResource); its stride is then the one to honor.
+                    let (stride, modifier) = match *layout.read() {
+                        Some(layout) => (layout.planes[0].stride, layout.modifier),
+                        None => (*width * 4, 0),
+                    };
+                    diag::set(Slot::PresentLastDstLayoutStride, if layout.read().is_some() { stride } else { 0 });
+                    if !flags.contains(VirglFlags::MAP_COHERENT) {
+                        return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+                    }
+                    if attached < alloc.size() {
+                        return Err(Stat::PresentLocalIneligibleDstNotAttached);
+                    }
+                    Ok(Surface { format: (*format).into(), stride, width: *width, height: *height, modifier })
+                },
             }
-            let Some(info) = *info.read() else {
-                return Err(Stat::PresentLocalIneligibleNoInfo);
-            };
-            Ok(info)
         }
 
         fn is_4bpp(format: u32) -> bool {
@@ -363,10 +398,9 @@ impl Device {
                 r.right as u32 <= width && r.bottom as u32 <= height
         }
 
-        let (src_w, src_h) = ((cover_rect.right - cover_rect.left) as u32, (cover_rect.bottom - cover_rect.top) as u32);
         diag::set(Slot::PresentLastSubRectCnt, dst_subrects.len() as u32);
-        diag::set(Slot::PresentLastCoverWidth, src_w);
-        diag::set(Slot::PresentLastCoverHeight, src_h);
+        diag::set(Slot::PresentLastCoverWidth, (cover_rect.right - cover_rect.left) as u32);
+        diag::set(Slot::PresentLastCoverHeight, (cover_rect.bottom - cover_rect.top) as u32);
 
         let flags = present.Flags;
         if !flags.Blt() || flags.Flip() || flags.FlipWithNoWait() || flags.ColorFill() ||
@@ -374,35 +408,29 @@ impl Device {
             return Err(Stat::PresentLocalIneligibleFlags);
         }
 
-        let src = blob_of(src_alloc, Slot::PresentLastSrcBlobMem)?;
-        let dst = blob_of(dst_alloc, Slot::PresentLastDstBlobMem)?;
+        let src = surface_of(src_alloc, false)?;
+        let dst = surface_of(dst_alloc, true)?;
+        diag::set(Slot::PresentLastSrcFormat, src.format);
+        diag::set(Slot::PresentLastDstFormat, dst.format);
+        diag::set(Slot::PresentLastSrcStride, src.stride);
+        diag::set(Slot::PresentLastDstStride, dst.stride);
+        diag::set(Slot::PresentLastSrcModifierLo, src.modifier as u32);
+        diag::set(Slot::PresentLastDstModifierLo, dst.modifier as u32);
+        diag::set(Slot::PresentLastSrcWidth, src.width);
+        diag::set(Slot::PresentLastSrcHeight, src.height);
+        diag::set(Slot::PresentLastDstWidth, dst.width);
+        diag::set(Slot::PresentLastDstHeight, dst.height);
 
-        // Packed struct: copy fields out before use.
-        let (src_format, src_modifier, src_stride, src_width, src_height) =
-            (src.format, src.modifier, src.strides[0], src.width, src.height);
-        let (dst_format, dst_modifier, dst_stride, dst_width, dst_height) =
-            (dst.format, dst.modifier, dst.strides[0], dst.width, dst.height);
-        diag::set(Slot::PresentLastSrcFormat, src_format);
-        diag::set(Slot::PresentLastDstFormat, dst_format);
-        diag::set(Slot::PresentLastSrcStride, src_stride);
-        diag::set(Slot::PresentLastDstStride, dst_stride);
-        diag::set(Slot::PresentLastSrcModifierLo, src_modifier as u32);
-        diag::set(Slot::PresentLastDstModifierLo, dst_modifier as u32);
-        diag::set(Slot::PresentLastSrcWidth, src_width);
-        diag::set(Slot::PresentLastSrcHeight, src_height);
-        diag::set(Slot::PresentLastDstWidth, dst_width);
-        diag::set(Slot::PresentLastDstHeight, dst_height);
-
-        if src_modifier != 0 || dst_modifier != 0 {
+        if src.modifier != 0 || dst.modifier != 0 {
             return Err(Stat::PresentLocalIneligibleTiled);
         }
-        if src_stride == 0 || dst_stride == 0 {
+        if src.stride == 0 || dst.stride == 0 {
             return Err(Stat::PresentLocalIneligibleStride);
         }
-        if !is_4bpp(src_format) || !is_4bpp(dst_format) {
+        if !is_4bpp(src.format) || !is_4bpp(dst.format) {
             return Err(Stat::PresentLocalIneligibleFormatUnsupported);
         }
-        if src_format != dst_format {
+        if src.format != dst.format {
             return Err(Stat::PresentLocalIneligibleFormatMismatch);
         }
 
@@ -414,7 +442,7 @@ impl Device {
         }
 
         for r in dst_subrects {
-            if !inside(r, dst_width, dst_height) || !inside(&(*r + (dx, dy)), src_width, src_height) {
+            if !inside(r, dst.width, dst.height) || !inside(&(*r + (dx, dy)), src.width, src.height) {
                 return Err(Stat::PresentLocalIneligibleBounds);
             }
         }

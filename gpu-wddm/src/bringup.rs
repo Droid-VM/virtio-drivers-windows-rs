@@ -20,7 +20,8 @@ pub mod runtime {
         PresentLocalIneligibleNoInfo, PresentLocalIneligibleTiled,
         PresentLocalIneligibleStride, PresentLocalIneligibleFormatUnsupported,
         PresentLocalIneligibleFormatMismatch, PresentLocalIneligibleScaled,
-        PresentLocalIneligibleBounds,
+        PresentLocalIneligibleBounds, PresentLocalIneligibleDstNotAttached,
+        StdAllocSharedPrimary, StdAllocShadow, StdAllocStaging, StdAllocOther,
         Count,
     }
 
@@ -34,6 +35,9 @@ pub mod runtime {
         PresentLastDstWidth, PresentLastDstHeight,
         PresentLastSubRectCnt, PresentLastCoverWidth, PresentLastCoverHeight,
         PresentLastSrcBlobMem, PresentLastDstBlobMem,
+        /// 1 = guest blob, 2 = classic 3D (standard allocation), 0 = other.
+        PresentLastSrcKind, PresentLastDstKind,
+        PresentLastDst3dFlags, PresentLastDstLayoutStride, PresentLastDstAttachedBytes,
         Count,
     }
 
@@ -85,7 +89,8 @@ pub mod runtime {
                 "RtPresentLocalIneligibleNoInfo", "RtPresentLocalIneligibleTiled",
                 "RtPresentLocalIneligibleStride", "RtPresentLocalIneligibleFormatUnsupported",
                 "RtPresentLocalIneligibleFormatMismatch", "RtPresentLocalIneligibleScaled",
-                "RtPresentLocalIneligibleBounds",
+                "RtPresentLocalIneligibleBounds", "RtPresentLocalIneligibleDstNotAttached",
+                "RtStdAllocSharedPrimary", "RtStdAllocShadow", "RtStdAllocStaging", "RtStdAllocOther",
             ];
             const SLOT_NAMES: [&str; Slot::Count as usize] = [
                 "RtPresentLastSrcFormat", "RtPresentLastDstFormat",
@@ -95,6 +100,8 @@ pub mod runtime {
                 "RtPresentLastDstWidth", "RtPresentLastDstHeight",
                 "RtPresentLastSubRectCnt", "RtPresentLastCoverWidth", "RtPresentLastCoverHeight",
                 "RtPresentLastSrcBlobMem", "RtPresentLastDstBlobMem",
+                "RtPresentLastSrcKind", "RtPresentLastDstKind",
+                "RtPresentLastDst3dFlags", "RtPresentLastDstLayoutStride", "RtPresentLastDstAttachedBytes",
             ];
             super::record("RuntimeDiagnosticsRevision", 987);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
