@@ -320,6 +320,111 @@ impl Device {
         Ok(layout)
     }
 
+    /// Fast-path admission for a blt present done by an in-guest memcpy
+    /// (kmd-blt-present-plan.md §1.1). Both allocations must be linear,
+    /// guest-backed blobs of the same 4-byte format, with no scaling and every
+    /// sub-rectangle inside both images. Returns the first failed check as the
+    /// diagnostic counter to bump. Pure: touches no state beyond the last-seen
+    /// diagnostic slots.
+    fn present_local_copy_eligible(
+        src_alloc: &Allocation,
+        dst_alloc: &Allocation,
+        present: &DXGKARG_PRESENT,
+        dst_subrects: &[RECT],
+        cover_rect: &RECT,
+        (dx, dy): (i32, i32),
+    ) -> Result<(), crate::bringup::runtime::Stat> {
+        use crate::bringup::runtime::{self as diag, Slot, Stat};
+
+        fn blob_of(alloc: &Allocation, mem_slot: Slot) -> Result<BlobInfo, Stat> {
+            let VirtioResource::Blob { mem, info, .. } = alloc.resource() else {
+                return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+            };
+            diag::set(mem_slot, mem.bits());
+            if !mem.contains(BlobMem::GUEST) || alloc.guest_backing().is_none() {
+                return Err(Stat::PresentLocalIneligibleNotGuestBlob);
+            }
+            let Some(info) = *info.read() else {
+                return Err(Stat::PresentLocalIneligibleNoInfo);
+            };
+            Ok(info)
+        }
+
+        fn is_4bpp(format: u32) -> bool {
+            matches!(format,
+                VIRGL_FORMAT_B8G8R8A8_UNORM | VIRGL_FORMAT_B8G8R8X8_UNORM |
+                VIRGL_FORMAT_R8G8B8A8_UNORM | VIRGL_FORMAT_R8G8B8X8_UNORM |
+                VIRGL_FORMAT_B8G8R8A8_SRGB  | VIRGL_FORMAT_B8G8R8X8_SRGB  |
+                VIRGL_FORMAT_R8G8B8A8_SRGB)
+        }
+
+        fn inside(r: &RECT, width: u32, height: u32) -> bool {
+            r.left >= 0 && r.top >= 0 && r.right > r.left && r.bottom > r.top &&
+                r.right as u32 <= width && r.bottom as u32 <= height
+        }
+
+        let (src_w, src_h) = ((cover_rect.right - cover_rect.left) as u32, (cover_rect.bottom - cover_rect.top) as u32);
+        diag::set(Slot::PresentLastSubRectCnt, dst_subrects.len() as u32);
+        diag::set(Slot::PresentLastCoverWidth, src_w);
+        diag::set(Slot::PresentLastCoverHeight, src_h);
+
+        let flags = present.Flags;
+        if !flags.Blt() || flags.Flip() || flags.FlipWithNoWait() || flags.ColorFill() ||
+            flags.SrcColorKey() || flags.DstColorKey() || flags.LinearToSrgb() {
+            return Err(Stat::PresentLocalIneligibleFlags);
+        }
+
+        let src = blob_of(src_alloc, Slot::PresentLastSrcBlobMem)?;
+        let dst = blob_of(dst_alloc, Slot::PresentLastDstBlobMem)?;
+
+        // Packed struct: copy fields out before use.
+        let (src_format, src_modifier, src_stride, src_width, src_height) =
+            (src.format, src.modifier, src.strides[0], src.width, src.height);
+        let (dst_format, dst_modifier, dst_stride, dst_width, dst_height) =
+            (dst.format, dst.modifier, dst.strides[0], dst.width, dst.height);
+        diag::set(Slot::PresentLastSrcFormat, src_format);
+        diag::set(Slot::PresentLastDstFormat, dst_format);
+        diag::set(Slot::PresentLastSrcStride, src_stride);
+        diag::set(Slot::PresentLastDstStride, dst_stride);
+        diag::set(Slot::PresentLastSrcModifierLo, src_modifier as u32);
+        diag::set(Slot::PresentLastDstModifierLo, dst_modifier as u32);
+        diag::set(Slot::PresentLastSrcWidth, src_width);
+        diag::set(Slot::PresentLastSrcHeight, src_height);
+        diag::set(Slot::PresentLastDstWidth, dst_width);
+        diag::set(Slot::PresentLastDstHeight, dst_height);
+
+        if src_modifier != 0 || dst_modifier != 0 {
+            return Err(Stat::PresentLocalIneligibleTiled);
+        }
+        if src_stride == 0 || dst_stride == 0 {
+            return Err(Stat::PresentLocalIneligibleStride);
+        }
+        if !is_4bpp(src_format) || !is_4bpp(dst_format) {
+            return Err(Stat::PresentLocalIneligibleFormatUnsupported);
+        }
+        if src_format != dst_format {
+            return Err(Stat::PresentLocalIneligibleFormatMismatch);
+        }
+
+        let src_rect = present.SrcRect;
+        let dst_rect = present.DstRect;
+        if src_rect.right - src_rect.left != dst_rect.right - dst_rect.left ||
+            src_rect.bottom - src_rect.top != dst_rect.bottom - dst_rect.top {
+            return Err(Stat::PresentLocalIneligibleScaled);
+        }
+
+        for r in dst_subrects {
+            if !inside(r, dst_width, dst_height) || !inside(&(*r + (dx, dy)), src_width, src_height) {
+                return Err(Stat::PresentLocalIneligibleBounds);
+            }
+        }
+        if dst_subrects.len() > 4 {
+            diag::hit(Stat::PresentLocalManySubRects);
+        }
+
+        Ok(())
+    }
+
     pub fn present(&self, present: &mut DXGKARG_PRESENT) -> Result<(), NtStatus> {
         trace!("{}: device: {:?}, flags: {:?}", function!(), self, present.Flags);
 
@@ -408,6 +513,16 @@ impl Device {
 
         let dx = present.SrcRect.left - present.DstRect.left;
         let dy = present.SrcRect.top  - present.DstRect.top;
+
+        // kmd-blt-present-plan.md P0: classify only, behavior is unchanged.
+        {
+            use crate::bringup::runtime::{self as diag, Stat};
+            diag::hit(Stat::PresentEnter);
+            match Self::present_local_copy_eligible(&src_alloc, &dst_alloc, present, dst_subrects, &cover_rect, (dx, dy)) {
+                Ok(()) => diag::hit(Stat::PresentLocalEligible),
+                Err(reason) => diag::hit(reason),
+            }
+        }
 
         src.ensure_virgl_attached().inspect_err(|e|
             error!("{}: failed to attach to virgl: {:?}", function!(), src_alloc)

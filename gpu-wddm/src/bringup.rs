@@ -13,6 +13,27 @@ pub mod runtime {
         IrqEnter, IrqHandled, DpcEnter, DpcReturn,
         ControlWake, ControlResponsesDone, ControlRequestsDone,
         DmaCompleteEnter, DmaCompleteReturn, NotifyEnter, NotifyReturn,
+        // Blt present local-copy eligibility (kmd-blt-present-plan.md P0).
+        // Counted only; behavior is unchanged until P1.
+        PresentEnter, PresentLocalEligible, PresentLocalManySubRects,
+        PresentLocalIneligibleFlags, PresentLocalIneligibleNotGuestBlob,
+        PresentLocalIneligibleNoInfo, PresentLocalIneligibleTiled,
+        PresentLocalIneligibleStride, PresentLocalIneligibleFormatUnsupported,
+        PresentLocalIneligibleFormatMismatch, PresentLocalIneligibleScaled,
+        PresentLocalIneligibleBounds,
+        Count,
+    }
+
+    /// Last-seen values, overwritten on every hit; published next to the counters.
+    #[derive(Clone, Copy)]
+    pub enum Slot {
+        PresentLastSrcFormat, PresentLastDstFormat,
+        PresentLastSrcStride, PresentLastDstStride,
+        PresentLastSrcModifierLo, PresentLastDstModifierLo,
+        PresentLastSrcWidth, PresentLastSrcHeight,
+        PresentLastDstWidth, PresentLastDstHeight,
+        PresentLastSubRectCnt, PresentLastCoverWidth, PresentLastCoverHeight,
+        PresentLastSrcBlobMem, PresentLastDstBlobMem,
         Count,
     }
 
@@ -24,11 +45,20 @@ pub mod runtime {
     #[cfg(feature = "bringup-diagnostics")]
     static FENCES: [[AtomicU32; 64]; 3] =
         [const { [const { AtomicU32::new(0) }; 64] }; 3];
+    #[cfg(feature = "bringup-diagnostics")]
+    static SLOTS: [AtomicU32; Slot::Count as usize] =
+        [const { AtomicU32::new(0) }; Slot::Count as usize];
 
     #[inline]
     pub fn hit(stat: Stat) {
         #[cfg(feature = "bringup-diagnostics")]
         COUNTERS[stat as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set(slot: Slot, value: u32) {
+        #[cfg(feature = "bringup-diagnostics")]
+        SLOTS[slot as usize].store(value, Ordering::Relaxed);
     }
 
     /// phase: 0 submitted, 1 response callback, 2 notify returned successfully.
@@ -50,10 +80,28 @@ pub mod runtime {
                 "RtIrqEnter", "RtIrqHandled", "RtDpcEnter", "RtDpcReturn",
                 "RtControlWake", "RtControlResponsesDone", "RtControlRequestsDone",
                 "RtDmaCompleteEnter", "RtDmaCompleteReturn", "RtNotifyEnter", "RtNotifyReturn",
+                "RtPresentEnter", "RtPresentLocalEligible", "RtPresentLocalManySubRects",
+                "RtPresentLocalIneligibleFlags", "RtPresentLocalIneligibleNotGuestBlob",
+                "RtPresentLocalIneligibleNoInfo", "RtPresentLocalIneligibleTiled",
+                "RtPresentLocalIneligibleStride", "RtPresentLocalIneligibleFormatUnsupported",
+                "RtPresentLocalIneligibleFormatMismatch", "RtPresentLocalIneligibleScaled",
+                "RtPresentLocalIneligibleBounds",
             ];
-            super::record("RuntimeDiagnosticsRevision", 938);
+            const SLOT_NAMES: [&str; Slot::Count as usize] = [
+                "RtPresentLastSrcFormat", "RtPresentLastDstFormat",
+                "RtPresentLastSrcStride", "RtPresentLastDstStride",
+                "RtPresentLastSrcModifierLo", "RtPresentLastDstModifierLo",
+                "RtPresentLastSrcWidth", "RtPresentLastSrcHeight",
+                "RtPresentLastDstWidth", "RtPresentLastDstHeight",
+                "RtPresentLastSubRectCnt", "RtPresentLastCoverWidth", "RtPresentLastCoverHeight",
+                "RtPresentLastSrcBlobMem", "RtPresentLastDstBlobMem",
+            ];
+            super::record("RuntimeDiagnosticsRevision", 987);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
                 super::record(name, counter.load(Ordering::Relaxed));
+            }
+            for (name, slot) in SLOT_NAMES.iter().zip(SLOTS.iter()) {
+                super::record(name, slot.load(Ordering::Relaxed));
             }
             for node in 0..64 {
                 let values = core::array::from_fn::<_, 3, _>(|phase| FENCES[phase][node].load(Ordering::Relaxed));
