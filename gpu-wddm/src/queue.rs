@@ -1631,6 +1631,7 @@ struct LocalCopyJob {
     fence: u32,
     copy: Box<LocalCopy>,
     allocations: AllocationsBatch,
+    submitted: u64,
 }
 
 impl GpuData {
@@ -1674,14 +1675,19 @@ impl GpuData {
             ran = true;
             diag::set(Slot::LocalCopyRunFence, job.fence);
             let (t0, freq) = ke_query_performance_counter();
+            let wait_us = ((t0.wrapping_sub(job.submitted)) * 1_000_000 / freq.max(1)) as u32;
+            diag::set(Slot::LocalCopyWaitLastUs, wait_us);
+            diag::set_max(Slot::LocalCopyWaitMaxUs, wait_us);
+            diag::add(Slot::LocalCopyWaitSumUs, wait_us);
             job.copy.execute();
             let (t1, _) = ke_query_performance_counter();
             let us = ((t1.wrapping_sub(t0)) * 1_000_000 / freq.max(1)) as u32;
             diag::set(Slot::LocalCopyLastUs, us);
             diag::set_max(Slot::LocalCopyMaxUs, us);
+            diag::add(Slot::LocalCopySumUs, us);
             diag::set(Slot::LocalCopyLastSwizzle, job.copy.swizzle as u32);
             diag::hit(Stat::LocalCopyDone);
-            let LocalCopyJob { engine, fence, copy, allocations } = job;
+            let LocalCopyJob { engine, fence, copy, allocations, .. } = job;
             drop(copy);
             drop(allocations);
             self.notify_dma_completed(engine, fence);
@@ -2291,7 +2297,7 @@ impl GpuChannel {
         engine_state.submit(fence);
         diag::set(Slot::LocalCopySubmitFence, fence);
         diag::set(Slot::LocalCopySubmitEngine, engine.node_ordinal());
-        let job = LocalCopyJob { engine, fence, copy, allocations };
+        let job = LocalCopyJob { engine, fence, copy, allocations, submitted: ke_query_performance_counter().0 };
         let queued = {
             let mut queue = self.data.local_copies.lock();
             if queue.try_reserve(1).is_ok() {

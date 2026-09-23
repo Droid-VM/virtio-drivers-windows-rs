@@ -46,6 +46,7 @@ pub mod runtime {
         LocalCopySubmitFence, LocalCopySubmitEngine, LocalCopySubmitLastCompleted,
         LocalCopyRunFence, LocalCopyDoneFence, LocalCopyDoneLastCompleted,
         LocalCopyMapFailSide, LocalCopyMapFailStatus,
+        LocalCopySumUs, LocalCopyWaitLastUs, LocalCopyWaitMaxUs, LocalCopyWaitSumUs,
         Count,
     }
 
@@ -71,6 +72,12 @@ pub mod runtime {
     pub fn set(slot: Slot, value: u32) {
         #[cfg(feature = "bringup-diagnostics")]
         SLOTS[slot as usize].store(value, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn add(slot: Slot, value: u32) {
+        #[cfg(feature = "bringup-diagnostics")]
+        SLOTS[slot as usize].fetch_add(value, Ordering::Relaxed);
     }
 
     #[inline]
@@ -123,8 +130,9 @@ pub mod runtime {
                 "RtLocalCopySubmitFence", "RtLocalCopySubmitEngine", "RtLocalCopySubmitLastCompleted",
                 "RtLocalCopyRunFence", "RtLocalCopyDoneFence", "RtLocalCopyDoneLastCompleted",
                 "RtLocalCopyMapFailSide", "RtLocalCopyMapFailStatus",
+                "RtLocalCopySumUs", "RtLocalCopyWaitLastUs", "RtLocalCopyWaitMaxUs", "RtLocalCopyWaitSumUs",
             ];
-            super::record("RuntimeDiagnosticsRevision", 991);
+            super::record("RuntimeDiagnosticsRevision", 993);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
                 super::record(name, counter.load(Ordering::Relaxed));
             }

@@ -2617,6 +2617,12 @@ impl Adapter {
                 let cpu_visible = crate::virgl::VirglFlags::from_bits_truncate(alloc_3d.flags)
                     .contains(crate::virgl::VirglFlags::MAP_COHERENT);
                 alloc_info.FlagsWddm2_mut().set_CpuVisible(cpu_visible);
+                // Lock() maps aperture pages uncached unless Cached is set. The
+                // redirection staging surface is read back by DXGI on every
+                // blt present (ETW: Lock/Unlock 4.2 ms for 3.2 MB on 992); the
+                // only GPU access to these pages is host-side transfer, so a
+                // cached CPU mapping is safe.
+                alloc_info.FlagsWddm2_mut().set_Cached(cpu_visible);
                 alloc_info.FlagsWddm2_mut().set_AccessedPhysically(true);
                 crate::bringup::record("Alloc3dLastCpuVisible", cpu_visible as u32);
                 crate::bringup::record("Alloc3dLastVirglFlags", alloc_3d.flags);
