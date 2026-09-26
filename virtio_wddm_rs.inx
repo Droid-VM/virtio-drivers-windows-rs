@@ -69,6 +69,8 @@ HKR,,TypesSupported,%REG_DWORD%,7
 [VirtioGpu_DeviceSettings]
 HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\dx11um_virtio.dll,%13%\dx11um_virtio.dll,%13%\dx11um_virtio.dll,%13%\dx11um_virtio.dll
 HKR,, VulkanDriverName,            %REG_SZ%,       %13%\virtio_icd.x86_64.json
+HKR,, D3D12Enable,                 %REG_DWORD%,    1
+HKR,, D3D12FeatureLevelOverride,  %REG_DWORD%,    0
 
 ;HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
 ;HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
