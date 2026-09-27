@@ -1898,16 +1898,18 @@ unsafe extern "C" fn format_history_buffer(adapter: HANDLE, format_data: *mut DX
 }
 
 unsafe extern "C" fn calibrate_gpu_clock(adapter: HANDLE, node: u32, engine: u32, clock_calibration: *mut DXGKARG_CALIBRATEGPUCLOCK) -> NTSTATUS {
-    trace!("{}: not implemented", function!());
+    let clock_calibration = check_arg!(mut clock_calibration);
+    let (timestamp, frequency) = ke_query_performance_counter();
 
-    //let clock_calibration = check_arg!(mut clock_calibration);
-    //let (ts, freq) = ke_query_performance_counter();
-    //clock_calibration.GpuFrequency = freq;
-    //clock_calibration.GpuClockCounter = ts;
-    //clock_calibration.CpuClockCounter = ts;
+    /* The renderer and the KMD do not expose a separate hardware clock. Use
+     * one QPC domain for both values so D3D12's calibrated timestamp contract
+     * remains monotonic and the conversion has an honest frequency. */
+    clock_calibration.GpuFrequency = frequency;
+    clock_calibration.GpuClockCounter = timestamp;
+    clock_calibration.CpuClockCounter = timestamp;
+    trace!("{}: node={} engine={} timestamp={} frequency={}", function!(), node, engine, timestamp, frequency);
 
-    STATUS::NOT_SUPPORTED.to_u32()
-    //STATUS::SUCCESS.to_u32()
+    STATUS::SUCCESS.to_u32()
 }
 
 /*
