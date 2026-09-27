@@ -918,6 +918,9 @@ pub struct Adapter {
     device: NonNull<UnsafeCell<DEVICE_OBJECT>>,
     state: InitOption<AdapterState>,
     flip_timer: Option<FlipTimer>,
+    /// Callback data needed to rebuild the transport after a TDR reset.
+    start_info: Option<DXGK_START_INFO>,
+    start_interface: Option<DXGKRNL_INTERFACE>,
 }
 
 pub const PAGING_DMA_BUFFER_SIZE: u32 = 128 * 1024;
@@ -1028,6 +1031,8 @@ impl Adapter {
             device: device,
             state <- InitOption::none(),
             flip_timer: None,
+            start_info: None,
+            start_interface: None,
         }? NtStatus)
     }
 
@@ -1135,6 +1140,9 @@ impl Adapter {
     pub fn start(&mut self, start_info: &DXGK_START_INFO, interface: DXGKRNL_INTERFACE) -> Result<u8, NtStatus> {
         crate::bringup::record("StartStage", 1);
         trace!("{}", function!());
+
+        self.start_info = Some(*start_info);
+        self.start_interface = Some(interface);
 
         {
             use crate::bringup::runtime::{self as diag, Slot};
@@ -1957,6 +1965,40 @@ impl Adapter {
         self.state.clear();
 
         result
+    }
+
+    /// Quiesce the old queue before dropping its VirtIO rings. Channel clones
+    /// held by WDDM objects remain reset-gated and cannot submit into freed
+    /// buffers.
+    pub fn reset_from_timeout(&mut self) -> Result<(), NtStatus> {
+        info!("{}: beginning adapter reset", function!());
+
+        let timer_result = if let Some(flip_timer) = self.flip_timer.take() {
+            flip_timer.stop()
+        } else {
+            Ok(())
+        };
+
+        if let Some(state) = self.state.as_mut() {
+            state.queue_handler.begin_reset();
+        }
+        self.state.clear();
+
+        timer_result.inspect_err(|e| {
+            error!("{}: failed to stop flip timer during reset: {:?}", function!(), e)
+        })?;
+
+        info!("{}: adapter reset complete", function!());
+        Ok(())
+    }
+
+    /// Rebuild the VirtIO transport and queues from the callback tables saved
+    /// at the last start. Existing device/context objects keep their old,
+    /// reset-gated channels and must be recreated by dxgkrnl.
+    pub fn restart_from_timeout(&mut self) -> Result<u8, NtStatus> {
+        let start_info = self.start_info.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
+        let interface = self.start_interface.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
+        self.start(&start_info, interface)
     }
 
     pub fn stop_and_release(&mut self) -> Result<DXGK_DISPLAY_INFORMATION, NtStatus> {

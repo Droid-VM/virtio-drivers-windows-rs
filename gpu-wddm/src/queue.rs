@@ -598,6 +598,8 @@ impl<T> ArraySegQueue<T> {
 struct AsyncQueue<T> {
     #[pin]
     event: KeEvent,
+    push_lock: SpinMutex<()>,
+    closed: AtomicBool,
 
     q: ArraySegQueue<T>,
 }
@@ -611,17 +613,34 @@ impl<T> AsyncQueue<T> {
     fn init(cap: usize) -> impl PinInit<Self, NtStatus> {
         pin_init!(Self {
             event <- KeEvent::new(EventType::Synchronization, false),
+            push_lock: SpinMutex::new(()),
+            closed: AtomicBool::new(false),
             q: ArraySegQueue::new(cap),
         }? NtStatus)
     }
 
-    fn push(&self, value: T) {
+    fn push(&self, value: T) -> Result<(), NtStatus> {
+        let _guard = self.push_lock.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(NtStatus(STATUS::REINITIALIZATION_NEEDED));
+        }
         self.q.push(value);
         self.event.set();
+        Ok(())
     }
 
     fn pop(&self) -> Option<T> {
         self.q.pop()
+    }
+
+    fn close(&self) {
+        let _guard = self.push_lock.lock();
+        self.closed.store(true, Ordering::Release);
+        self.event.clear();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn event(self: &Pin<Arc<Self>>) -> Pin<&KeEvent> {
@@ -653,8 +672,7 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
     }
 
     pub fn request_async_buf(&self, input: MaybeInlineBuffer<IN>, output: MaybeInlineBuffer<OUT>, callback: Callback<OUT>) -> Result<(), NtStatus> {
-        self.0.push(Buffer { input, output, callback });
-        Ok(())
+        self.0.push(Buffer { input, output, callback })
     }
 
     pub fn request_async_into_buf<Req: IntoBytes + Immutable + KnownLayout>(&self, req: Req, output: MaybeInlineBuffer<OUT>, callback: Callback<OUT>) -> Result<(), NtStatus> {
@@ -735,8 +753,7 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
         let output = MaybeInlineBuffer::try_new_zeroed::<Rsp>()?;
         let callback = Callback::DmaCompletedBatched(engine, fence, allocations);
 
-        self.0.push(Buffer { input, output, callback });
-        Ok(())
+        self.0.push(Buffer { input, output, callback })
     }
 
     pub fn pop_queued_request(&self) -> Option<Buffer<IN, OUT>> {
@@ -745,6 +762,14 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
 
     pub fn get_queue_event(&self) -> Pin<&KeEvent> {
         self.0.event()
+    }
+
+    fn close(&self) {
+        self.0.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 }
 
@@ -1022,6 +1047,11 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             self.free.push(i).unwrap();
             return Ok(None);
         };
+
+        if self.chan.is_closed() {
+            self.free.push(i).unwrap();
+            return Ok(Some(()));
+        }
 
         //warn!("{}: popped {} from the list of free virtio buffers ({} / {})", function!(), i, self.free.len(), SIZE);
         //trace!("{}: got new buffer from queue", function!());
@@ -1608,6 +1638,14 @@ struct GpuData {
     pub interface: DxgkInterface,
     pub shmem: VirtioCapabilityInfo,
 
+    /// Set before the VirtIO queues are stopped.  GpuChannel values are
+    /// cloned into WDDM device/context objects, so they can outlive the
+    /// QueueHandler that created them.  This gate makes those stale handles
+    /// fail before they update fence/accounting state or touch freed DMA
+    /// buffers during a reset.
+    resetting: AtomicBool,
+    reset_epoch: AtomicU64,
+
     resource_id: SimpleIdAllocator,
     context_id: SimpleIdAllocator,
     offset_allocator: SpinMutex<offset_allocator::Allocator>,
@@ -1644,6 +1682,8 @@ impl GpuData {
             host3d_budget,
             interface,
             shmem,
+            resetting: AtomicBool::new(false),
+            reset_epoch: AtomicU64::new(0),
             resource_id: SimpleIdAllocator::new(1),
             context_id: SimpleIdAllocator::new(1),
             offset_allocator: SpinMutex::new(offset_allocator::Allocator::with_max_allocs(shmem_pages, 1024 * 1024)),
@@ -1662,6 +1702,15 @@ impl GpuData {
             local_copies: SpinMutex::new(VecDeque::new()),
             local_copy_event: Arc::pin_init(KeEvent::new(EventType::Synchronization, false))?,
         }? NtStatus)
+    }
+
+    fn begin_reset(&self) {
+        self.reset_epoch.fetch_add(1, Ordering::AcqRel);
+        self.resetting.store(true, Ordering::Release);
+    }
+
+    fn is_resetting(&self) -> bool {
+        self.resetting.load(Ordering::Acquire)
     }
 
     /// Run every queued present copy, then complete its fence. PASSIVE_LEVEL
@@ -1842,6 +1891,14 @@ pub struct GpuChannel {
 }
 
 impl GpuChannel {
+    fn ensure_running(&self) -> Result<(), NtStatus> {
+        if self.data.is_resetting() {
+            Err(NtStatus(STATUS::REINITIALIZATION_NEEDED))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn supports_guest_alloc(&self) -> bool { self.data.guest_alloc_supported }
 
     fn next_fence(&self) -> u64 {
@@ -2276,6 +2333,10 @@ impl GpuChannel {
     }
 
     pub fn submit_fence(&self, engine: Engine, dxgk_fence: u32, virtio_fence: u64) {
+        if self.data.is_resetting() {
+            warn!("{}: dropping fence {} while reset is in progress", function!(), dxgk_fence);
+            return;
+        }
         self.data.engines[engine.node_ordinal() as usize].submit(dxgk_fence);
 
         if self.data.fence.query(virtio_fence) {
@@ -2292,6 +2353,7 @@ impl GpuChannel {
     /// DISPATCH_LEVEL. If the queue cannot grow, the copy runs inline rather
     /// than losing the frame or the fence.
     pub fn submit_local_copy(&self, engine: Engine, fence: u32, copy: Box<LocalCopy>, allocations: AllocationsBatch) -> Result<(), NtStatus> {
+        self.ensure_running()?;
         let engine_state = &self.data.engines[engine.node_ordinal() as usize];
         diag::set(Slot::LocalCopySubmitLastCompleted, engine_state.last_completed_fence.load(Ordering::SeqCst));
         engine_state.submit(fence);
@@ -2328,6 +2390,7 @@ impl GpuChannel {
     }
 
     pub fn submit_command(&self, engine: Engine, fence: u32, cmd: &Command, allocations: Option<AllocationsBatch>) -> Result<(), NtStatus> {
+        self.ensure_running()?;
         //warn!("{}: engine: {:?} fence: {}, timestamp {:?}", function!(), engine, fence, ke_query_performance_counter());
         self.data.engines[engine.node_ordinal() as usize].submit(fence);
 
@@ -2360,6 +2423,7 @@ impl GpuChannel {
     }
 
     pub fn submit_command_batch(&self, engine: Engine, fence: u32, cmds: &[Command], allocations: AllocationsBatch) -> Result<(), NtStatus> {
+        self.ensure_running()?;
         //warn!("{}: engine: {:?}, fence: {}, timestamp {:?}", function!(), engine, fence, ke_query_performance_counter());
 
         assert!(cmds.len() > 1);
@@ -2400,6 +2464,7 @@ impl GpuChannel {
     }
 
     pub fn submit_command_buffer(&self, engine: Engine, fence: u32, ctx_id: NonZero<u32>, ring: Option<u8>, data: &[u8]) -> Result<(), NtStatus> {
+        self.ensure_running()?;
         trace!("{}: engine {:?}, fence {}, ctx {}, ring {:?}, data {:?}", function!(), engine, fence, ctx_id, ring, data);
         self.data.engines[engine.node_ordinal() as usize].submit(fence);
 
@@ -2418,6 +2483,7 @@ impl GpuChannel {
     }
 
     pub fn submit_command_buffer_with_fence(&self, engine: Engine, ctx_id: NonZero<u32>, ring: Option<u8>, data: &[u8]) -> Result<u64, NtStatus> {
+        self.ensure_running()?;
         trace!("{}: engine {:?}, ctx {}, ring {:?}, data {:?}", function!(), engine, ctx_id, ring, data);
 
         let hdr = commands::CmdSubmit3d {
@@ -2570,6 +2636,7 @@ pub struct QueueHandler {
     data: Arc<GpuData>,
     pub chan: GpuChannel,
     thread: Pin<Box<Thread>>,
+    shutdown: bool,
 }
 
 const _: () = assert!(size_of::<QueueHandler>() <= 21504*2);
@@ -2630,6 +2697,7 @@ impl QueueHandler {
                     cursor: cursor.chan.clone(),
                     data: data.clone(),
                 },
+                shutdown: false,
             }? NtStatus).chain(|handler| {
                 // DRIVER_OK lets the host activate the device immediately.
                 // Publish it only after both queues and all fallible state
@@ -2805,20 +2873,23 @@ impl QueueHandler {
     pub fn notify_queued_fences(&self, engine: Engine) {
         self.data.notify_queued_fences(engine);
     }
-}
 
-impl Drop for QueueHandler {
-    fn drop(&mut self) {
-        trace!("{}", function!());
+    /// Quiesce the queue and reset the transport while all queue-owned DMA
+    /// memory is still alive.  The reset gate is published before stopping
+    /// the worker so stale GpuChannel clones cannot race a descriptor teardown.
+    pub fn begin_reset(&mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.data.begin_reset();
+        self.control.chan.close();
+        self.cursor.chan.close();
         self.thread.stop();
-
-        //for res_id in self.data.resource_id.free.lock().iter() {
-        //    warn!("{}: used resource id: {}", function!(), res_id);
-        //}
-        //
-        //for ctx_id in self.data.context_id.free.lock().iter() {
-        //    warn!("{}: used context id: {}", function!(), ctx_id);
-        //}
 
         if let Some(thread) = self.thread.thread().take() {
             info!("{}: waiting for queue handler thread to finish...", function!());
@@ -2830,5 +2901,21 @@ impl Drop for QueueHandler {
 
         self.pci_transport.queue_unset(QUEUE_TRANSMIT);
         self.pci_transport.queue_unset(QUEUE_CURSOR);
+
+        /* Reset while the QueueHandler still owns the VirtQueue descriptor and
+         * ring memory. Wait for the device to acknowledge reset before that
+         * memory can be released. */
+        let reset_status = virtio_drivers::transport::DeviceStatus::empty();
+        self.pci_transport.set_status(reset_status);
+        while self.pci_transport.get_status() != reset_status {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Drop for QueueHandler {
+    fn drop(&mut self) {
+        trace!("{}", function!());
+        self.shutdown();
     }
 }

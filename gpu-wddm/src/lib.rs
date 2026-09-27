@@ -1787,9 +1787,15 @@ unsafe extern "C" fn query_current_fence(adapter: HANDLE, current_fence: *mut DX
 }
 
 unsafe extern "C" fn reset_engine(adapter: HANDLE, reset_engine: *mut DXGKARG_RESETENGINE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
-
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    let gpu = check_handle!(adapter: Adapter);
+    info!("{}: resetting all engines after timeout", function!());
+    match gpu.reset_from_timeout() {
+        Ok(()) => STATUS::SUCCESS.to_u32(),
+        Err(status) => {
+            error!("{}: adapter reset failed: {:?}", function!(), status);
+            status.to_u32()
+        }
+    }
 }
 
 unsafe extern "C" fn query_engine_status(adapter: HANDLE, query: *mut DXGKARG_QUERYENGINESTATUS) -> NTSTATUS {
@@ -1833,15 +1839,30 @@ unsafe extern "C" fn collect_dbg_info(adapter: HANDLE, collect_dbg_info: *const 
 }
 
 unsafe extern "C" fn reset_from_timeout(adapter: HANDLE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
-
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    let gpu = check_handle!(adapter: Adapter);
+    info!("{}: resetting adapter after timeout", function!());
+    match gpu.reset_from_timeout() {
+        Ok(()) => STATUS::SUCCESS.to_u32(),
+        Err(status) => {
+            error!("{}: adapter reset failed: {:?}", function!(), status);
+            status.to_u32()
+        }
+    }
 }
 
 unsafe extern "C" fn restart_from_timeout(adapter: HANDLE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
-
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    let gpu = check_handle!(adapter: Adapter);
+    info!("{}: restarting adapter after timeout", function!());
+    match gpu.restart_from_timeout() {
+        Ok(n_scanouts) => {
+            info!("{}: adapter restarted with {} scanouts", function!(), n_scanouts);
+            STATUS::SUCCESS.to_u32()
+        }
+        Err(status) => {
+            error!("{}: adapter restart failed: {:?}", function!(), status);
+            status.to_u32()
+        }
+    }
 }
 
 unsafe extern "C" fn control_interrupt2(adapter: HANDLE, interrupt_control: DXGKARG_CONTROLINTERRUPT2) -> NTSTATUS {
