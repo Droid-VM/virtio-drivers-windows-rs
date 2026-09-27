@@ -1717,6 +1717,12 @@ impl GpuData {
     /// (the handler thread); `notify_fence` orders completion against packets
     /// still in flight on the virtio ring.
     fn run_local_copies(&self) {
+        if self.is_resetting() {
+            // The worker may observe its wakeup concurrently with TDR
+            // teardown. Drop stale copies without touching old fence state.
+            self.local_copies.lock().clear();
+            return;
+        }
         let mut ran = false;
         loop {
             let job = self.local_copies.lock().pop_front();
@@ -1761,6 +1767,9 @@ impl GpuData {
     }
 
     fn notify_fence(&self, engine: Engine, fence: u32, notify_cb: &dyn Fn(Engine, u32)) {
+        if self.is_resetting() {
+            return;
+        }
         let engine_state = &self.engines[engine.node_ordinal() as usize];
 
         let last_completed = engine_state.last_completed_fence.load(Ordering::SeqCst);
@@ -1778,6 +1787,9 @@ impl GpuData {
     }
 
     fn notify_dma_completed(&self, engine: Engine, fence: u32) {
+        if self.is_resetting() {
+            return;
+        }
         diag::hit(Stat::DmaCompleteEnter);
         diag::fence(1, engine.node_ordinal(), fence);
         self.notify_fence(engine, fence, &|engine, fence| {
@@ -1787,16 +1799,25 @@ impl GpuData {
     }
 
     fn notify_dma_faulted(&self, engine: Engine, fence: u32) {
+        if self.is_resetting() {
+            return;
+        }
         self.notify_fence(engine, fence, &|engine, fence| {
             let _ = self.interface.notify_interrupt_synchronized(Interrupt::DmaFaulted(engine, fence));
         });
     }
 
     fn notify_dma_preempted(&self, engine: Engine, preemption_fence: u32, last_completed_fence: u32) {
+        if self.is_resetting() {
+            return;
+        }
         let _ = self.interface.notify_interrupt_synchronized(Interrupt::DmaPreempted(engine, preemption_fence, last_completed_fence));
     }
 
     fn notify_queued_fences(&self, engine: Engine) {
+        if self.is_resetting() {
+            return;
+        }
         let engine_state = &self.engines[engine.node_ordinal() as usize];
 
         let mut last_completed = engine_state.last_completed_fence.load(Ordering::SeqCst);
@@ -1831,6 +1852,10 @@ impl GpuData {
     }
 
     fn handle_fence_submissions(&self) {
+        if self.is_resetting() {
+            self.fence_submissions.lock().clear();
+            return;
+        }
         let mut resubmit = SmallVec::<[FenceSubmission; 8]>::new();
 
         self.fence_submissions.lock().retain(|fence| {
@@ -2386,6 +2411,9 @@ impl GpuChannel {
     }
 
     pub fn submit_preemption(&self, engine: Engine, preemption_fence: u32) {
+        if self.data.is_resetting() {
+            return;
+        }
         self.data.engines[engine.node_ordinal() as usize].last_preemption_fence.store(preemption_fence, Ordering::SeqCst);
     }
 
@@ -2887,6 +2915,12 @@ impl QueueHandler {
         }
         self.shutdown = true;
         self.data.begin_reset();
+        self.data.local_copies.lock().clear();
+        self.data.fence_submissions.lock().clear();
+        for engine in &self.data.engines {
+            engine.pending_fences.lock().clear();
+            engine.last_preemption_fence.store(0, Ordering::SeqCst);
+        }
         self.control.chan.close();
         self.cursor.chan.close();
         self.thread.stop();
