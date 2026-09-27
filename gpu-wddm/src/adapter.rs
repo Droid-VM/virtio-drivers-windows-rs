@@ -1971,23 +1971,30 @@ impl Adapter {
     /// held by WDDM objects remain reset-gated and cannot submit into freed
     /// buffers.
     pub fn reset_from_timeout(&mut self) -> Result<(), NtStatus> {
+        crate::bringup::record("TdrResetStage", 1);
         info!("{}: beginning adapter reset", function!());
 
+        crate::bringup::record("TdrResetStage", 2);
         let timer_result = if let Some(flip_timer) = self.flip_timer.take() {
             flip_timer.stop()
         } else {
             Ok(())
         };
+        crate::bringup::record("TdrResetStage", 3);
 
         if let Some(state) = self.state.as_mut() {
+            crate::bringup::record("TdrResetStage", 4);
             state.queue_handler.begin_reset();
+            crate::bringup::record("TdrResetStage", 5);
         }
         self.state.clear();
+        crate::bringup::record("TdrResetStage", 6);
 
         timer_result.inspect_err(|e| {
             error!("{}: failed to stop flip timer during reset: {:?}", function!(), e)
         })?;
 
+        crate::bringup::record("TdrResetStage", 7);
         info!("{}: adapter reset complete", function!());
         Ok(())
     }
@@ -1996,9 +2003,13 @@ impl Adapter {
     /// at the last start. Existing device/context objects keep their old,
     /// reset-gated channels and must be recreated by dxgkrnl.
     pub fn restart_from_timeout(&mut self) -> Result<u8, NtStatus> {
+        crate::bringup::record("TdrRestartStage", 30);
         let start_info = self.start_info.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
         let interface = self.start_interface.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
-        self.start(&start_info, interface)
+        crate::bringup::record("TdrRestartStage", 31);
+        let result = self.start(&start_info, interface);
+        crate::bringup::record("TdrRestartStage", 32);
+        result
     }
 
     pub fn stop_and_release(&mut self) -> Result<DXGK_DISPLAY_INFORMATION, NtStatus> {

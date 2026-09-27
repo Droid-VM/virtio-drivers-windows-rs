@@ -2906,6 +2906,7 @@ impl QueueHandler {
     /// memory is still alive.  The reset gate is published before stopping
     /// the worker so stale GpuChannel clones cannot race a descriptor teardown.
     pub fn begin_reset(&mut self) {
+        crate::bringup::record("TdrResetStage", 10);
         self.shutdown();
     }
 
@@ -2914,6 +2915,7 @@ impl QueueHandler {
             return;
         }
         self.shutdown = true;
+        crate::bringup::record("TdrResetStage", 11);
         self.data.begin_reset();
         self.data.local_copies.lock().clear();
         self.data.fence_submissions.lock().clear();
@@ -2923,27 +2925,35 @@ impl QueueHandler {
         }
         self.control.chan.close();
         self.cursor.chan.close();
+        crate::bringup::record("TdrResetStage", 12);
         self.thread.stop();
+        crate::bringup::record("TdrResetStage", 13);
 
         if let Some(thread) = self.thread.thread().take() {
             info!("{}: waiting for queue handler thread to finish...", function!());
+            crate::bringup::record("TdrResetStage", 14);
             let _ = thread.join(NtTime::INFINITE).inspect_err(|e|
                 error!("{}: failed to wait for thread to finish: {:?}", function!(), e)
             );
+            crate::bringup::record("TdrResetStage", 15);
         }
         info!("{}: queue handler thread stopped", function!());
 
         self.pci_transport.queue_unset(QUEUE_TRANSMIT);
         self.pci_transport.queue_unset(QUEUE_CURSOR);
+        crate::bringup::record("TdrResetStage", 16);
 
         /* Reset while the QueueHandler still owns the VirtQueue descriptor and
          * ring memory. Wait for the device to acknowledge reset before that
          * memory can be released. */
         let reset_status = virtio_drivers::transport::DeviceStatus::empty();
+        crate::bringup::record("TdrResetStage", 17);
         self.pci_transport.set_status(reset_status);
+        crate::bringup::record("TdrResetStage", 18);
         while self.pci_transport.get_status() != reset_status {
             core::hint::spin_loop();
         }
+        crate::bringup::record("TdrResetStage", 19);
     }
 }
 

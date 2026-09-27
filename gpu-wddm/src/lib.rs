@@ -1839,11 +1839,16 @@ unsafe extern "C" fn collect_dbg_info(adapter: HANDLE, collect_dbg_info: *const 
 }
 
 unsafe extern "C" fn reset_from_timeout(adapter: HANDLE) -> NTSTATUS {
+    bringup::record("TdrResetCallback", 1);
     let gpu = check_handle!(adapter: Adapter);
     info!("{}: resetting adapter after timeout", function!());
     match gpu.reset_from_timeout() {
-        Ok(()) => STATUS::SUCCESS.to_u32(),
+        Ok(()) => {
+            bringup::record("TdrResetCallback", 2);
+            STATUS::SUCCESS.to_u32()
+        },
         Err(status) => {
+            bringup::record("TdrResetCallback", status.0.to_u32());
             error!("{}: adapter reset failed: {:?}", function!(), status);
             status.to_u32()
         }
@@ -1851,14 +1856,17 @@ unsafe extern "C" fn reset_from_timeout(adapter: HANDLE) -> NTSTATUS {
 }
 
 unsafe extern "C" fn restart_from_timeout(adapter: HANDLE) -> NTSTATUS {
+    bringup::record("TdrRestartCallback", 1);
     let gpu = check_handle!(adapter: Adapter);
     info!("{}: restarting adapter after timeout", function!());
     match gpu.restart_from_timeout() {
         Ok(n_scanouts) => {
+            bringup::record("TdrRestartCallback", 2);
             info!("{}: adapter restarted with {} scanouts", function!(), n_scanouts);
             STATUS::SUCCESS.to_u32()
         }
         Err(status) => {
+            bringup::record("TdrRestartCallback", status.0.to_u32());
             error!("{}: adapter restart failed: {:?}", function!(), status);
             status.to_u32()
         }
