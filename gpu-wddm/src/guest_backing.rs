@@ -118,6 +118,13 @@ impl GuestBacking {
         if size == 0 || size > u32::MAX as u64 {
             return Err(NtStatus(STATUS::INVALID_PARAMETER));
         }
+        // Large BOs only require contiguous 64 KiB DMA segments, not one
+        // contiguous range for the entire allocation. Avoid the expensive
+        // whole-range search/reclaim on fragmented guest RAM. The chunked
+        // path also supplies the MDL used for CPU mappings and teardown.
+        if size >= 2 * 1024 * 1024 {
+            return Self::new_chunked(size);
+        }
         let Some(raw) = NonNull::new(unsafe {
             MmAllocateContiguousMemory((size + ALIGN) as _,
                 LARGE_INTEGER { QuadPart: 0xFFFFFFFFFF }) as *mut u8
