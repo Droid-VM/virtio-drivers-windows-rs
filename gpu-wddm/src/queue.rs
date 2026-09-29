@@ -604,6 +604,29 @@ struct AsyncQueue<T> {
     q: ArraySegQueue<T>,
 }
 
+// Producers include the flip timer DPC. Raise IRQL before taking push_lock so
+// that the DPC cannot interrupt a same-CPU producer while it owns the lock.
+// Keep this guard local to the acquiring thread and drop the lock before it.
+struct QueueDispatchGuard {
+    old_irql: wdk::wdm::KIRQL,
+    _not_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl QueueDispatchGuard {
+    fn raise() -> Self {
+        Self {
+            old_irql: unsafe { wdk::wdm::KfRaiseIrql(wdk::wdm::DISPATCH_LEVEL as _) },
+            _not_send: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for QueueDispatchGuard {
+    fn drop(&mut self) {
+        unsafe { wdk::wdm::KfLowerIrql(self.old_irql) };
+    }
+}
+
 impl<T> AsyncQueue<T> {
     fn try_new(cap: usize) -> Result<Pin<Arc<Self>>, NtStatus> {
         let q: Pin<Arc<Self>> = Arc::try_pin_init(Self::init(cap))?;
@@ -620,6 +643,7 @@ impl<T> AsyncQueue<T> {
     }
 
     fn push(&self, value: T) -> Result<(), NtStatus> {
+        let _irql = QueueDispatchGuard::raise();
         let _guard = self.push_lock.lock();
         if self.closed.load(Ordering::Acquire) {
             return Err(NtStatus(STATUS::REINITIALIZATION_NEEDED));
@@ -634,6 +658,7 @@ impl<T> AsyncQueue<T> {
     }
 
     fn close(&self) {
+        let _irql = QueueDispatchGuard::raise();
         let _guard = self.push_lock.lock();
         self.closed.store(true, Ordering::Release);
         self.event.clear();
