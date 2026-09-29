@@ -248,6 +248,11 @@ pub enum VirtioResource {
         map: RwLock<Option<(offset_allocator::Allocation, u64)>>,
         size: u64,
     },
+    /// A pSystemMem wrap: dxgkrnl owns the pages (MDL over the UMD's host
+    /// memory); the KMD only records the size. No host resource, no segment.
+    Sysmem {
+        size: u64,
+    },
 }
 
 // This is stupid, there is absolutely no reason why this can't be derived
@@ -306,7 +311,8 @@ impl Clone for VirtioResource {
                     map: RwLock::new(map_val),
                     size: *size,
                 }
-            }
+            },
+            VirtioResource::Sysmem { size } => VirtioResource::Sysmem { size: *size },
         }
     }
 }
@@ -445,6 +451,12 @@ impl Into<AllocationInfo> for VirtioResource {
                     created: true,
                 }
             },
+            // The escape reports allocation info to the ICD; a sysmem wrap has
+            // no ICD counterpart, and nothing should be asking for it.
+            VirtioResource::Sysmem { .. } => {
+                warn!("VirtioResource::Sysmem escaped to AllocationInfo");
+                AllocationInfo { tag: ALLOCATE_SYSMEM_TAG }
+            },
         }
     }
 }
@@ -473,6 +485,7 @@ impl DeviceSpecificAllocation {
 
         if (alloc.flags.fetch_or(ALLOCATION_FLAG_CREATED, Ordering::SeqCst) & ALLOCATION_FLAG_CREATED) == 0 {
             match alloc.resource {
+                VirtioResource::Sysmem { .. } => {}
                 VirtioResource::_3D {..} => warn!("{}: 3d resources should have been created by now", function!()),
                 VirtioResource::Blob {id, mem, flags, size, ..} => {
                     debug!("{}: creating blob resource id {} ({})", function!(), alloc.id, id);
@@ -666,6 +679,7 @@ impl Allocation {
     /// the mapping cannot go stale while the allocation lives.
     pub fn kernel_address(&self) -> Result<NonNull<u8>, NtStatus> {
         match &self.resource {
+            VirtioResource::Sysmem { .. } => Err(NtStatus(STATUS::NOT_SUPPORTED)),
             VirtioResource::Blob { .. } => {
                 let backing = self.guest_backing.as_ref().ok_or(NtStatus(STATUS::INVALID_PARAMETER))?;
                 backing.kernel_address()
@@ -759,6 +773,8 @@ impl Allocation {
         match &self.resource {
             VirtioResource::_3D { .. } => false,
             VirtioResource::Blob { flags, .. } => flags.contains(BlobFlag::MAPPABLE),
+            // dxgkrnl maps the UMD's system pages directly.
+            VirtioResource::Sysmem { .. } => true,
         }
     }
 
@@ -846,6 +862,7 @@ impl Allocation {
                     None
                 }
             },
+            VirtioResource::Sysmem { .. } => None,
         }
     }
 
@@ -853,6 +870,7 @@ impl Allocation {
         match &self.resource {
             VirtioResource::Blob { map, .. } => map.read().map(|m| m.1),
             VirtioResource::_3D { .. } => None,
+            VirtioResource::Sysmem { .. } => None,
         }
     }
 
@@ -868,6 +886,7 @@ impl Allocation {
         let is_mapped = self.is_mapped();
 
         match &self.resource {
+            VirtioResource::Sysmem { .. } => Err(NtStatus(STATUS::NOT_SUPPORTED)),
             VirtioResource::_3D {..} => {
                 error!("{}: cannot map 3d resource: {:?}", function!(), self);
                 Err(NtStatus(STATUS::INVALID_PARAMETER))
@@ -897,6 +916,10 @@ impl Allocation {
         if self.is_mapped() {
             self.set_mapped(false);
             let offset_alloc = match &self.resource {
+                VirtioResource::Sysmem { .. } => {
+                    error!("{}: sysmem wrap cannot be blob-mapped", function!());
+                    return Err(NtStatus(STATUS::INVALID_PARAMETER));
+                },
                 VirtioResource::_3D {..} => {
                     unreachable!();
                 },
@@ -913,6 +936,7 @@ impl Allocation {
 
     pub fn set_blob_info(&self, blob_info: BlobInfo) -> Option<()> {
         match &self.resource {
+            VirtioResource::Sysmem { .. } => None,
             VirtioResource::_3D {..} => {
                 None
             },
@@ -1005,6 +1029,7 @@ impl Allocation {
                     format,
                 })
             },
+            VirtioResource::Sysmem { .. } => Err(NtStatus(STATUS::NOT_SUPPORTED)),
         }
     }
 
@@ -1012,6 +1037,7 @@ impl Allocation {
         match self.resource {
             VirtioResource::_3D { flags, .. } => flags.contains(VirglFlags::MAP_COHERENT),
             VirtioResource::Blob { mem, .. } => mem.contains(BlobMem::GUEST),
+            VirtioResource::Sysmem { .. } => true,
         }
     }
 
@@ -1019,6 +1045,7 @@ impl Allocation {
         match self.resource {
             VirtioResource::_3D { .. } => true,
             VirtioResource::Blob { mem, .. } => mem.contains(BlobMem::GUEST),
+            VirtioResource::Sysmem { .. } => false,
         }
     }
 
@@ -1026,6 +1053,7 @@ impl Allocation {
         match &self.resource {
             VirtioResource::_3D { map, .. } => map.read().1.len(),
             VirtioResource::Blob { .. } => 0,
+            VirtioResource::Sysmem { .. } => 0,
         }
     }
 
@@ -1033,6 +1061,7 @@ impl Allocation {
         match &self.resource {
             VirtioResource::_3D { size, .. } => *size as _,
             VirtioResource::Blob { size, .. } => *size as _,
+            VirtioResource::Sysmem { size, .. } => *size as _,
         }
     }
 
@@ -1040,11 +1069,13 @@ impl Allocation {
         match &self.resource {
             VirtioResource::_3D { map, .. } => map.read().1.iter().fold(0usize, |len, entry| len + entry.length as usize),
             VirtioResource::Blob { .. } => 0,
+            VirtioResource::Sysmem { .. } => 0,
         }
     }
 
     pub fn fill_attached_pages(&self, entries: &mut [MemEntry]) -> bool {
         match &self.resource {
+            VirtioResource::Sysmem { .. } => false,
             VirtioResource::_3D { map, .. } => {
                 entries.copy_from_slice(map.read().1.as_ref());
                 true
@@ -1143,9 +1174,9 @@ impl Allocation {
         }
     }
     */
-
     pub fn attach_pages(&self, offset: u64, pages: &[DXGK_PTE]) -> bool {
         match &self.resource {
+            VirtioResource::Sysmem { .. } => false,
             VirtioResource::_3D { map, size, .. } => {
                 let mut map = map.write();
                 let mut attached_size = map.1.iter().fold(0u64, |len, entry| len + entry.length as u64);

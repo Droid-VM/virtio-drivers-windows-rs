@@ -48,6 +48,7 @@ pub const ESCAPE_RESOURCE_ATTACH_TAG: u64 = u64::from_ne_bytes(*b"VESCRATT");
 pub const CREATE_RESOURCE_TAG:        u64 = u64::from_ne_bytes(*b"VALLRESR");
 pub const ALLOCATE_3D_TAG:            u64 = u64::from_ne_bytes(*b"VALL3DGL");
 pub const ALLOCATE_BLOB_TAG:          u64 = u64::from_ne_bytes(*b"VALLBLOB");
+pub const ALLOCATE_SYSMEM_TAG:       u64 = u64::from_ne_bytes(*b"VALLSYSM");
 
 pub const SUBMIT_COMMAND_VIRTUAL_TAG: u64 = u64::from_ne_bytes(*b"VSUBCMDV");
 
@@ -92,6 +93,7 @@ pub const ESCAPE_EXEC_BUF_TAG:        u64 = 0x4345584543534556u64;
 pub const CREATE_RESOURCE_TAG:        u64 = 0x525345524C4C4156u64;
 pub const ALLOCATE_3D_TAG:            u64 = 0x4C4744334C4C4156u64;
 pub const ALLOCATE_BLOB_TAG:          u64 = 0x424F4C424C4C4156u64;
+pub const ALLOCATE_SYSMEM_TAG:       u64 = 0x4D5359534C4C4156u64;
 
 pub const SUBMIT_COMMAND_VIRTUAL_TAG: u64 = 0x56444D4342555356u64;
 
@@ -618,6 +620,15 @@ pub struct Allocate3d {
     pub last_level: u32,
     pub nr_samples: u32,
     pub flags: u32,
+    pub size: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone, Tagged)]
+#[tagged(ALLOCATE_SYSMEM_TAG)]
+pub struct AllocateSysmem {
+    pub tag: u64,
+
     pub size: u64,
 }
 

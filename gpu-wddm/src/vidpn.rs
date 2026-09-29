@@ -1082,6 +1082,7 @@ impl FlipTimerContext {
             //let _ = wdk::wdm::ke_delay_execution_thread(wdk::wdm::NtTime::relative_ms(10));
 
             match alloc.resource() {
+                VirtioResource::Sysmem { .. } => {}
                 VirtioResource::_3D { .. } => {
                     let _ = self.chan.set_scanout(self.rects[i], i as u32, res_id).inspect_err(|e|
                         error!("{}: failed to set scanout: {:?}", function!(), e)

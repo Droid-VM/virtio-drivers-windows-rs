@@ -2685,6 +2685,37 @@ impl Adapter {
 
                 Ok(allocation)
             },
+            ALLOCATE_SYSMEM_TAG => {
+                // A pSystemMem wrap for the D3D12 UMD: dxgkrnl owns the pages
+                // (MDL over the UMD's inner host memory) and the runtime maps
+                // them for Map(NULL)/WriteToSubresource. Record the size, mark
+                // the allocation CPU-visible, and stay out of every segment:
+                // the GPU reaches these pages through the ICD's own blob, not
+                // through VidMm residency.
+                let sysmem = unsafe { &*(alloc_info.pPrivateDriverData as *const crate::uapi::AllocateSysmem) };
+                if sysmem.size == 0 || sysmem.size > (1 << 40) {
+                    return Err(NtStatus(STATUS::INVALID_PARAMETER));
+                }
+                let resource_id = chan.next_resource_id().ok_or(STATUS::NO_MEMORY)?;
+                let allocation = Arc::try_new(Allocation::new(resource_id, None, VirtioResource::Sysmem { size: sysmem.size })?)?;
+                crate::bringup::record("AllocSysmem", sysmem.size as u32);
+
+                // dxgkrnl rejects an allocation with no residency segment:
+                // report the aperture like the classic 3D path. The pages come
+                // from dxgkrnl's MDL over the UMD's host memory; the aperture
+                // entry only gives VidMm a bookkeeping location.
+                alloc_info.EvictionSegmentSet = 1;
+                alloc_info.PreferredSegment.set_SegmentId0(MemorySegment::Aperture3D as _);
+                alloc_info.PreferredSegment.set_Direction0(false);
+                *alloc_info.Alignment_mut() = 0;
+                alloc_info.Size = sysmem.size;
+                alloc_info.FlagsWddm2_mut().set_CpuVisible(true);
+                alloc_info.FlagsWddm2_mut().set_Cached(true);
+                *alloc_info.SupportedReadSegmentSet_mut() = MemorySegment::Aperture3D.mask();
+                alloc_info.SupportedWriteSegmentSet = MemorySegment::Aperture3D.mask();
+
+                Ok(allocation)
+            },
             _ => {
                 error!("unknown allocation type: {:x}", alloc_priv.tag());
                 Err(NtStatus(STATUS::INVALID_PARAMETER))
@@ -2763,6 +2794,7 @@ impl Adapter {
         if alloc.is_mapped() {
             debug!("{}: unmapping blob: {:?}", function!(), alloc);
             let offset = match alloc.resource() {
+               VirtioResource::Sysmem { .. } => return,
                VirtioResource::_3D {..} => {
                    unreachable!()
                },

@@ -367,6 +367,7 @@ impl Device {
                 (Slot::PresentLastSrcKind, Slot::PresentLastSrcBlobMem)
             };
             match alloc.resource() {
+                VirtioResource::Sysmem { .. } => Err(Stat::PresentLocalIneligibleNotGuestBlob),
                 VirtioResource::Blob { mem, info, .. } => {
                     diag::set(kind_slot, 1);
                     diag::set(mem_slot, mem.bits());
