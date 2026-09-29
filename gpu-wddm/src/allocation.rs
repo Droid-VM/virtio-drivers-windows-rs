@@ -505,7 +505,11 @@ impl DeviceSpecificAllocation {
         }
 
         trace!("{}: attaching resource {} to context {} ", function!(), alloc.id, device.context().and_then(|id| Some(id.get())).unwrap_or(0));
-        device.context_attach_resource(alloc.id)?;
+        // Sysmem allocations only describe pages to VidMm. They have no host
+        // resource, so their locally assigned ID must not reach the host.
+        if !matches!(alloc.resource, VirtioResource::Sysmem { .. }) {
+            device.context_attach_resource(alloc.id)?;
+        }
 
         Ok(Self {
             tag: VIRTIO_GPU_DEVICE_SPECIFIC_ALLOCATION_TAG,
@@ -522,6 +526,9 @@ impl DeviceSpecificAllocation {
 
     pub fn ensure_virgl_attached(&self) -> Result<(), NtStatus> {
         let alloc = self.alloc.upgrade().expect("checked by caller already");
+        if matches!(alloc.resource, VirtioResource::Sysmem { .. }) {
+            return Err(NtStatus(STATUS::NOT_SUPPORTED));
+        }
         let device = self.device.upgrade().expect("device should still exist");
 
         if matches!(device.capset(), Some(CapsetId::Virgl) | Some(CapsetId::Virgl2)) {
@@ -559,6 +566,10 @@ impl Drop for DeviceSpecificAllocation {
             error!("{}: allocation no longer exists", function!());
             return;
         };
+
+        if matches!(alloc.resource, VirtioResource::Sysmem { .. }) {
+            return;
+        }
 
         let Some(device) = self.device.upgrade() else {
             error!("{}: device no longer exists", function!());

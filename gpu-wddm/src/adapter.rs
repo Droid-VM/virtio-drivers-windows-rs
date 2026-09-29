@@ -2784,6 +2784,10 @@ impl Adapter {
     }
 
     pub fn destroy_allocation_inner(chan: &GpuChannel, alloc: &Allocation) {
+        // The sysmem wrapper never creates a host resource to unmap or unref.
+        if matches!(alloc.resource(), VirtioResource::Sysmem { .. }) {
+            return;
+        }
         let Some(id) = alloc.id() else {
             // No need to destroy resources which were never created
             return;
