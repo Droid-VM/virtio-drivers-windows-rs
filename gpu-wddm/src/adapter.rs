@@ -3298,11 +3298,13 @@ impl Adapter {
                     for mode in output.modes.iter() {
                         debug!("{}: creating new mode: {:?}", function!(), mode);
 
-                        let mut mode_info = source_mode_set.create_new_mode_info_autorelease()?;
-                        mode_info.Type = D3DKMDT_VIDPN_SOURCE_MODE_TYPE::D3DKMDT_RMT_GRAPHICS;
-                        mode.fill_graphics_info(unsafe { &mut mode_info.Format.Graphics });
-                        debug!("{}: adding new mode", function!());
-                        source_mode_set.add_mode_autorelease(mode_info)?;
+                        for pixel_format in SUPPORTED_SOURCE_FORMATS {
+                            let mut mode_info = source_mode_set.create_new_mode_info_autorelease()?;
+                            mode_info.Type = D3DKMDT_VIDPN_SOURCE_MODE_TYPE::D3DKMDT_RMT_GRAPHICS;
+                            mode.fill_graphics_info(unsafe { &mut mode_info.Format.Graphics }, pixel_format);
+                            debug!("{}: adding new mode", function!());
+                            source_mode_set.add_mode_autorelease(mode_info)?;
+                        }
                     }
 
                     debug!("{}: assigning new source modeset", function!());

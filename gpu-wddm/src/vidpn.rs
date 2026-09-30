@@ -926,6 +926,13 @@ pub fn check_vidpn_present_path(num_scanouts: u8, path: &D3DKMDT_VIDPN_PRESENT_P
     Ok(())
 }
 
+// Keep BGRA first for the desktop, but also expose RGBA for DXGI applications.
+// Scanout takes its pixel format from the allocation, not the VidPN source mode.
+pub const SUPPORTED_SOURCE_FORMATS: [D3DDDIFORMAT; 2] = [
+    D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8,
+    D3DDDIFORMAT::D3DDDIFMT_A8B8G8R8,
+];
+
 pub fn check_vidpn_source_mode(source_mode: &D3DKMDT_VIDPN_SOURCE_MODE) -> Result<(), NtStatus> {
     trace!("{}", function!());
     if source_mode.Type != D3DKMDT_VIDPN_SOURCE_MODE_TYPE::D3DKMDT_RMT_GRAPHICS {
@@ -948,7 +955,7 @@ pub fn check_vidpn_source_mode(source_mode: &D3DKMDT_VIDPN_SOURCE_MODE) -> Resul
         return Err(NtStatus(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE_MODE));
     }
 
-    if graphics.PixelFormat != D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8 {
+    if !SUPPORTED_SOURCE_FORMATS.contains(&graphics.PixelFormat) {
         error!("{}: invalid pixel format: {:?}", function!(), graphics.PixelFormat);
         return Err(NtStatus(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE_MODE));
     }
@@ -975,12 +982,12 @@ impl MonitorMode {
         info.__bindgen_anon_1.ScanLineOrdering = D3DDDI_VIDEO_SIGNAL_SCANLINE_ORDERING::D3DDDI_VSSLO_PROGRESSIVE;
     }
 
-    pub fn fill_graphics_info(&self, info: &mut D3DKMDT_GRAPHICS_RENDERING_FORMAT) {
+    pub fn fill_graphics_info(&self, info: &mut D3DKMDT_GRAPHICS_RENDERING_FORMAT, pixel_format: D3DDDIFORMAT) {
         info.PrimSurfSize.cx = self.width;
         info.PrimSurfSize.cy = self.height;
         info.VisibleRegionSize = info.PrimSurfSize;
         info.Stride = self.width * 4;
-        info.PixelFormat = D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8;
+        info.PixelFormat = pixel_format;
         info.ColorBasis = D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SCRGB;
         info.PixelValueAccessMode = D3DKMDT_PIXEL_VALUE_ACCESS_MODE::D3DKMDT_PVAM_DIRECT;
     }
