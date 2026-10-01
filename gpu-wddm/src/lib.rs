@@ -52,6 +52,7 @@ mod adapter;
 mod logger;
 mod uapi;
 mod queue;
+mod staging_pages;
 mod init_option;
 mod device;
 mod allocation;
@@ -1367,7 +1368,7 @@ unsafe extern "C" fn create_context(device: HANDLE, create_context: *mut DXGKARG
     if create_context.Flags.GdiContext() || create_context.Flags.SystemContext() {
         create_context.hContext = TaggedExt::into_arc_handle(context);
         create_context.ContextInfo.DmaBufferSegmentSet = 0;
-        create_context.ContextInfo.DmaBufferSize = 1024 * 1024;
+        create_context.ContextInfo.DmaBufferSize = crate::adapter::GRAPHICS_DMA_BUFFER_SIZE;
         create_context.ContextInfo.DmaBufferPrivateDataSize = 128;
         create_context.ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
         create_context.ContextInfo.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
@@ -1399,7 +1400,7 @@ unsafe extern "C" fn create_context(device: HANDLE, create_context: *mut DXGKARG
             Engine::Graphics | Engine::PhysicalOther => {
                 create_context.hContext = TaggedExt::into_arc_handle(context);
                 create_context.ContextInfo.DmaBufferSegmentSet = 0;
-                create_context.ContextInfo.DmaBufferSize = /*8 **/ 1024 * 1024;
+                create_context.ContextInfo.DmaBufferSize = crate::adapter::GRAPHICS_DMA_BUFFER_SIZE;
                 create_context.ContextInfo.DmaBufferPrivateDataSize = 4096;
                 create_context.ContextInfo.AllocationListSize = 1024;
                 create_context.ContextInfo.PatchLocationListSize = 1024;

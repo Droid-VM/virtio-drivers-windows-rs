@@ -292,6 +292,10 @@ const CURSOR_QUEUE_SIZE:  usize = 16;
 const CONTROL_FAST_QUEUE_SIZE: usize = CONTROL_QUEUE_SIZE * 3;
 const CURSOR_FAST_QUEUE_SIZE:  usize = CURSOR_QUEUE_SIZE * 4;
 
+const MAX_WDDM_COMMAND_BYTES: usize = crate::adapter::GRAPHICS_DMA_BUFFER_SIZE as usize;
+const COMMAND_STAGING_PAGES: usize = 2 * MAX_WDDM_COMMAND_BYTES / PAGE_SIZE;
+const _: () = assert!(crate::adapter::PAGING_DMA_BUFFER_SIZE as usize <= MAX_WDDM_COMMAND_BYTES);
+
 const FAST_QUEUE_SIZE: usize = 2048;
 
 /*
@@ -673,11 +677,42 @@ impl<T> AsyncQueue<T> {
     }
 }
 
+/// WDDM maps its system DMA buffers Normal-NC on ARM64. The CPU host reads
+/// guest RAM through a WB mapping, which can retain stale cache lines after
+/// NC guest writes. Give the host a WB command copy instead. Allocate once at
+/// device start, not in DxgkDdiSubmitCommand; retain each lease through used.
+struct CommandStaging<const SIZE: usize> {
+    memory: Dma<DxgkInterface>,
+    pages: crate::staging_pages::StagingPages<COMMAND_STAGING_PAGES, SIZE>,
+}
+
+impl<const SIZE: usize> CommandStaging<SIZE> {
+    fn new() -> Result<Self, NtStatus> {
+        Ok(Self {
+            memory: Dma::new(COMMAND_STAGING_PAGES, BufferDirection::DriverToDevice, false)?,
+            pages: crate::staging_pages::StagingPages::new(),
+        })
+    }
+
+    fn copy(&mut self, slot: usize, source: &[u8]) -> Option<NonNull<[u8]>> {
+        let start = self.pages.acquire(slot, source.len().div_ceil(PAGE_SIZE))?;
+        // Only borrow this lease, never the whole arena: other leases may
+        // still be read by the host. This allocation is physically contiguous.
+        let dest = unsafe {
+            core::slice::from_raw_parts_mut(self.memory.vaddr(start * PAGE_SIZE).as_ptr(), source.len())
+        };
+        dest.copy_from_slice(source);
+        Some(NonNull::from_mut(dest))
+    }
+}
+
 struct Queue<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const OUT: usize> {
     queue: VirtQueue<DxgkInterface, SIZE>,
     buffers: Buffers<SIZE, IN, OUT>,
     free: ArrayQueue<usize>,
     response_error_reported: bool,
+    staging: Option<CommandStaging<SIZE>>,
+    pending_request: Option<Buffer<IN, OUT>>,
     //nop: SegQueue<u32>,
 
     //chan: Pin<Arc<AsyncQueue<Buffer<IN, OUT>>>>,
@@ -760,6 +795,9 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
     }
 
     pub fn request_async_dma<Rsp: FromBytes + IntoBytes + KnownLayout>(&self, dma: NonNull<[u8]>, engine: Engine, fence: u32, allocations: Option<AllocationsBatch>) -> Result<(), NtStatus> {
+        if dma.len() == 0 || dma.len() > MAX_WDDM_COMMAND_BYTES {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
         let input = MaybeInlineBuffer::Dma { data: dma };
         let output = MaybeInlineBuffer::try_new_zeroed::<Rsp>()?;
 
@@ -774,6 +812,9 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
 
     // Caller MUST call the corresponding KeEvent::set after queuing all the commands
     pub fn request_async_dma_batched<Rsp: FromBytes + IntoBytes + KnownLayout>(&self, dma: NonNull<[u8]>, engine: Engine, fence: u32, allocations: Arc<AllocationsBatch>) -> Result<(), NtStatus> {
+        if dma.len() == 0 || dma.len() > MAX_WDDM_COMMAND_BYTES {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
         let input = MaybeInlineBuffer::Dma { data: dma };
         let output = MaybeInlineBuffer::try_new_zeroed::<Rsp>()?;
         let callback = Callback::DmaCompletedBatched(engine, fence, allocations);
@@ -838,6 +879,8 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             //nop: SegQueue::new(),
             free <- init_free,
             response_error_reported: false,
+            staging: if Q == QUEUE_TRANSMIT { Some(CommandStaging::new()?) } else { None },
+            pending_request: None,
             //last_submitted_fence: AtomicU64::new(0),
         }? NtStatus)
     }
@@ -999,6 +1042,9 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         self.buffers.inputs[i] = None;
         self.buffers.outputs[i] = None;
         self.buffers.callbacks[i] = Callback::None;
+        if let Some(staging) = &mut self.staging {
+            staging.pages.release(i);
+        }
 
         //debug!("{}: pushing {} to the list of free virtio buffers ({} / {})", function!(), i, self.free.len(), SIZE);
         self.free.push(i).unwrap();
@@ -1063,12 +1109,17 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
     }
 
     fn request(&mut self, pci_transport: &mut PciTransport) -> Result<Option<()>, NtStatus> {
+        // A control request uses an input and an output descriptor. Without
+        // indirect descriptors the ring can fill before the software slots do.
+        if self.queue.available_desc() < if Q == QUEUE_CURSOR { 1 } else { 2 } {
+            return Ok(None);
+        }
         let Some(i) = self.free.pop() else {
             debug!("{}: virtio queue is full: {} / {}", function!(), self.free.len(), SIZE);
             return Ok(None);
         };
 
-        let Some(buffer) = self.chan.0.pop() else {
+        let Some(mut buffer) = self.pending_request.take().or_else(|| self.chan.0.pop()) else {
             self.free.push(i).unwrap();
             return Ok(None);
         };
@@ -1076,6 +1127,19 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         if self.chan.is_closed() {
             self.free.push(i).unwrap();
             return Ok(Some(()));
+        }
+
+        if matches!(buffer.input, MaybeInlineBuffer::Dma { .. }) {
+            let staging = self.staging.as_mut().expect("WDDM DMA uses the control queue");
+            let Some(data) = staging.copy(i, buffer.input.as_ref()) else {
+                // Keep FIFO order and ownership of the WDDM buffer/callback.
+                // Completions release pages; the worker retries on its next
+                // response pass. Never drop or falsely complete this request.
+                self.pending_request = Some(buffer);
+                self.free.push(i).unwrap();
+                return Ok(None);
+            };
+            buffer.input = MaybeInlineBuffer::Dma { data };
         }
 
         //warn!("{}: popped {} from the list of free virtio buffers ({} / {})", function!(), i, self.free.len(), SIZE);
@@ -2480,6 +2544,13 @@ impl GpuChannel {
         //warn!("{}: engine: {:?}, fence: {}, timestamp {:?}", function!(), engine, fence, ke_query_performance_counter());
 
         assert!(cmds.len() > 1);
+
+        // Validate the entire batch before publishing any of its descriptors.
+        // The arena is sized for the DMA limits advertised to dxgkrnl.
+        if cmds.iter().any(|cmd| cmd.dma().is_none_or(|dma|
+            dma.len() == 0 || dma.len() > MAX_WDDM_COMMAND_BYTES)) {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
 
         self.data.engines[engine.node_ordinal() as usize].submit(fence);
 

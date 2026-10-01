@@ -924,6 +924,7 @@ pub struct Adapter {
 }
 
 pub const PAGING_DMA_BUFFER_SIZE: u32 = 128 * 1024;
+pub const GRAPHICS_DMA_BUFFER_SIZE: u32 = 1024 * 1024;
 
 /*
 pub const SEGMENT_ID_3D:            u8 = 1;
