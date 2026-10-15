@@ -579,7 +579,7 @@ macro_rules! select {
         let mut blocks = pin!(([MaybeUninit::<KWAIT_BLOCK>::uninit(); N_OBJECTS], PhantomPinned));
 
         // Optional bounded wait: Gunyah loses device interrupts for WFI vCPUs
-        // (win3d/docs/GPU间隔卡顿-20260918.md), so callers reacting to
+        // (win3d/docs/performance/GPU间隔卡顿-20260918.md), so callers reacting to
         // interrupt-driven events arm a timeout and poll on expiry instead of
         // blocking forever on a wake that never arrives.
         let mut timeout = NtTime::INFINITE;

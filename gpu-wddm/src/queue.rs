@@ -2929,7 +2929,7 @@ impl QueueHandler {
                 };
                 timeout(NtTime::relative_ms(5)) => {
                     // Poll fallback for lost device interrupts: Gunyah never
-                    // wakes a WFI vCPU for the INTx (win3d/docs/GPU间隔卡顿-20260918.md),
+                    // wakes a WFI vCPU for the INTx (win3d/docs/performance/GPU间隔卡顿-20260918.md),
                     // so during blob-allocation storms the irq events stay unset and
                     // every blocking request (D3DKMTAllocate et al) freezes the desktop
                     // ~1s until a timer wake. Draining the used rings here bounds that
