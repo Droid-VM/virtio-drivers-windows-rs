@@ -944,22 +944,27 @@ pub enum Engine {
     Graphics,
     PhysicalOther,
     Copy,
+    VideoDecode,
+    VideoEncode,
     Other(u8),
-    // TODO: do we need video engine?
 }
 
 impl Engine {
     const GRAPHICS_ENGINE:    u32 = 0;
     const PHYS_OTHER_ENGINE:  u32 = 1;
     const COPY_ENGINE:        u32 = 2;
+    const VIDEO_DECODE_ENGINE: u32 = 3;
+    const VIDEO_ENCODE_ENGINE: u32 = 4;
     /*
-     * This device has one render node, one physical-other node, and one
-     * paging/copy node. Do not advertise the spare node ordinals accepted by
-     * the old command decoder as GPU nodes: dxgkrnl uses this value to create
-     * the scheduler/statistics topology, and there is no corresponding
-     * hardware engine behind those ordinals.
+     * Render (3D), physical-other, paging/copy, and the two video nodes that
+     * make dxgkrnl publish "VideoDecode"/"VideoEncode" engine instances (the
+     * curves on Task Manager -> Performance -> GPU). The video nodes have no
+     * hardware queue of their own here: codec work runs on the separate
+     * virtio-media function, so they report 0% until something submits WDDM
+     * work to them. Node ordinals 3/4 used to be rejected (spare ordinals);
+     * they are now only valid for these two engines.
      */
-    pub const TOTAL_COUNT: u32 = 3;
+    pub const TOTAL_COUNT: u32 = 5;
     pub const NODE_MASK: u64 = (1u64 << Self::TOTAL_COUNT) - 1;
 
     pub const fn try_from_node_ordinal(index: u32) -> Option<Self> {
@@ -967,6 +972,8 @@ impl Engine {
             Engine::GRAPHICS_ENGINE => Some(Engine::Graphics),
             Engine::COPY_ENGINE => Some(Engine::Copy),
             Engine::PHYS_OTHER_ENGINE => Some(Engine::PhysicalOther),
+            Engine::VIDEO_DECODE_ENGINE => Some(Engine::VideoDecode),
+            Engine::VIDEO_ENCODE_ENGINE => Some(Engine::VideoEncode),
             _ => None,
         }
     }
@@ -976,6 +983,8 @@ impl Engine {
             Engine::Graphics => Engine::GRAPHICS_ENGINE,
             Engine::Copy => Engine::COPY_ENGINE,
             Engine::PhysicalOther => Engine::PHYS_OTHER_ENGINE,
+            Engine::VideoDecode => Engine::VIDEO_DECODE_ENGINE,
+            Engine::VideoEncode => Engine::VIDEO_ENCODE_ENGINE,
             Engine::Other(_) => panic!(),
         }
     }
@@ -998,6 +1007,14 @@ impl Engine {
             Engine::PhysicalOther => {
                 debug!("{}: {:?} -> DXGK_ENGINE_TYPE_OTHER (phys)", function!(), self);
                 metadata.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_OTHER;
+            },
+            Engine::VideoDecode => {
+                debug!("{}: {:?} -> DXGK_ENGINE_TYPE_VIDEO_DECODE", function!(), self);
+                metadata.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_VIDEO_DECODE;
+            },
+            Engine::VideoEncode => {
+                debug!("{}: {:?} -> DXGK_ENGINE_TYPE_VIDEO_ENCODE", function!(), self);
+                metadata.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_VIDEO_ENCODE;
             },
             Engine::Other(_) => {
                 debug!("{}: {:?} -> DXGK_ENGINE_TYPE_OTHER", function!(), self);

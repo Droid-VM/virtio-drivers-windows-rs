@@ -1,0 +1,74 @@
+;;
+;; virtio_media.inf — DroidVM virtio-media function driver (KMDF, skeleton)
+;;
+;; Matches the virtio-media PCI functions that crosvm creates with
+;;   --virtio-media kind=decoder,uid=... / kind=encoder,uid=...
+;; virtio device type VIRTIO_ID_MEDIA = 48, so the PCI device id is
+;;   0x1040 + 48 = 0x1070, vendor 0x1AF4, subsys 0x1070:0x1AF4, revision 1.
+;;
+;; P1c-3: virtio 1.x bring-up through ResourcesTranslated + MmMapIoSpaceEx;
+;;        no PCI configuration-space access at all.
+;;
+
+[Version]
+Signature      = "$Windows NT$"
+Class          = Media
+ClassGuid      = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider       = %ManufacturerName%
+CatalogFile    = virtio_media.cat
+DriverVer      = 10/21/2026,1.0.0.4
+PnpLockdown    = 1
+
+[DestinationDirs]
+VirtioMedia_Files.Drivers = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+virtio_media.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = DroidVM,NTARM64
+
+[DroidVM.NTARM64]
+; full hardware id as enumerated by the virtio-pci transport
+%VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070&SUBSYS_10701AF4&REV_01
+%VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070&SUBSYS_10701AF4
+%VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070
+
+[VirtioMedia_Device.NT]
+CopyFiles = VirtioMedia_Files.Drivers
+AddReg    = VirtioMedia_Device_AddReg
+
+[VirtioMedia_Device_AddReg]
+HKR,,FriendlyName,,%VirtioMedia.DeviceDesc%
+
+[VirtioMedia_Files.Drivers]
+virtio_media.sys,,,2
+
+[VirtioMedia_Device.NT.Services]
+AddService = VirtioMedia,0x00000002,VirtioMedia_Service_Install
+
+[VirtioMedia_Service_Install]
+DisplayName    = %VirtioMedia.Service%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\virtio_media.sys
+
+[VirtioMedia_Device.NT.Wdf]
+KmdfService = VirtioMedia,VirtioMedia_wdfsect
+
+[VirtioMedia_wdfsect]
+KmdfLibraryVersion = 1.27
+
+; MSI-X is intentionally absent: this skeleton does not own an interrupt.
+; [VirtioMedia_Device.NT.HW]
+; AddReg = VirtioMedia_MSIX
+
+[Strings]
+ManufacturerName       = "DroidVM"
+DiskName               = "DroidVM virtio-media Installation Disk"
+VirtioMedia.DeviceDesc = "DroidVM Video Media"
+VirtioMedia.Service    = "DroidVM virtio-media driver"

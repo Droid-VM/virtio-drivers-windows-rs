@@ -1405,7 +1405,7 @@ unsafe extern "C" fn create_context(device: HANDLE, create_context: *mut DXGKARG
                 create_context.ContextInfo.AllocationListSize = 1024;
                 create_context.ContextInfo.PatchLocationListSize = 1024;
             },
-           Engine::Copy | Engine::Other(_) => {
+           Engine::Copy | Engine::VideoDecode | Engine::VideoEncode | Engine::Other(_) => {
                 create_context.hContext = TaggedExt::into_arc_handle(context);
                 create_context.ContextInfo.DmaBufferSegmentSet = 0;
                 create_context.ContextInfo.DmaBufferSize = 0;

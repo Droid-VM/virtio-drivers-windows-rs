@@ -30,7 +30,7 @@ use crate::{
 use log::error;
 
 #[unsafe(no_mangle)]
-static WdfMinimumVersionRequired: ULONG = sys::WdfMinimumVersionRequired;
+static WdfMinimumVersionRequired: ULONG = 27; // KMDF 1.27 minor (0x1B); bindgen default is 0xFFFFFFFF
 
 pub fn WdfDriverCreate(DriverObject: PDRIVER_OBJECT, RegistryPath: PCUNICODE_STRING, DriverAttributes: PWDF_OBJECT_ATTRIBUTES, DriverConfig: PWDF_DRIVER_CONFIG) -> Result<(), winresult::NtStatus> {
     let pfn = unsafe { core::mem::transmute::<_, PFN_WDFDRIVERCREATE>(*WdfFunctions_01027.add(WDFFUNCENUM::WdfDriverCreateTableIndex.0 as _)) }.unwrap();

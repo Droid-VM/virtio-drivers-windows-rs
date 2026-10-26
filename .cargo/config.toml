@@ -40,3 +40,12 @@ rustflags = [
 
 [unstable]
 build-std = ["core", "alloc", "std"]
+
+# ARM64 kernel targets (virtio-media skeleton).  The per-target link flags for the
+# driver itself live in media-wdm/build.rs, so only the toolchain plumbing is here.
+[target.aarch64-pc-windows-msvc]
+linker = "rust-lld"
+rustflags = [
+  "-C", "linker-flavor=msvc-lld",
+  "-Z", "unstable-options",
+]
