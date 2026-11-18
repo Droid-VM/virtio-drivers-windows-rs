@@ -415,9 +415,16 @@ unsafe impl Sync for PciTransport {}
 
 impl Drop for PciTransport {
     fn drop(&mut self) {
-        // Reset the device when the transport is dropped.
+        // Reset the device when the transport is dropped.  Bounded: a wedged
+        // host that never clears the status byte must not spin a CPU forever in
+        // the TDR/close path (that alone is a hang of the whole guest).
         self.set_status(DeviceStatus::empty());
-        while self.get_status() != DeviceStatus::empty() {}
+        for _ in 0..1_000_000 {
+            if self.get_status() == DeviceStatus::empty() {
+                return;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 

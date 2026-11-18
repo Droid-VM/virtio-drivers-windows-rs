@@ -27,11 +27,18 @@ vulkan_virtio.dll = 1,,
 virtio_icd.x86_64.json = 1,,
 
 [Manufacturer]
-%ManufacturerName%=Standard,NTamd64.10.0...16299
+%ManufacturerName%=Standard,NTamd64.10.0...16299,NTARM64.10.0...16299
 
 [Standard.NTamd64.10.0...16299]
 %VirtioGpu.DeviceDesc% = VirtioGpu_Inst, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
 ;%VirtioGpu.DeviceDesc% = VirtioGpu_Inst, PCI\VEN_1AF4&DEV_6969&SUBSYS_11001AF4&REV_01
+
+; Windows on ARM64 (DroidVM guests): same install sections, plus a generic
+; hardware ID so guests that report a different SUBSYS/REV still match.
+[Standard.NTARM64.10.0...16299]
+%VirtioGpu.DeviceDesc% = VirtioGpu_Inst, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
+%VirtioGpu.DeviceDesc% = VirtioGpu_Inst, PCI\VEN_1AF4&DEV_1050
+%VirtioGpu.DeviceDesc% = VirtioGpu_Inst, PCI\VEN_1AF4&DEV_6969
 
 [VirtioGpu_Files.Driver]
 virtio_wddm_rs.sys,,,2

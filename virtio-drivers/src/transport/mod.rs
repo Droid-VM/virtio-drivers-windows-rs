@@ -135,15 +135,21 @@ pub trait Transport {
 
     /// Safely reads multiple fields from config space by ensuring that the config generation is the
     /// same before and after all reads, and retrying if not.
+    ///
+    /// Bounded: a wedged device can keep flipping `config_generation`, and this
+    /// runs in the TDR restart path where spinning forever means bugchecking the
+    /// guest. After the retry budget the last read is returned as-is.
     fn read_consistent<T>(&self, f: impl Fn() -> Result<T>) -> Result<T> {
-        loop {
+        let mut result = f();
+        for _ in 0..64 {
             let before = self.read_config_generation();
-            let result = f();
+            result = f();
             let after = self.read_config_generation();
             if before == after {
-                break result;
+                break;
             }
         }
+        result
     }
 }
 

@@ -321,8 +321,23 @@ where
             ..
         } = self.nodes[node_index.to_usize()];
 
-        // Double delete check
-        assert!(used);
+        // Double delete check.
+        //
+        // A double free is a caller bug, but this crate only owns bookkeeping
+        // state: panicking here used to take the whole Windows guest down via
+        // the driver's `#[panic_handler]` (`KeBugCheck(0xDEADDEAD)`).  Report
+        // and leave the free lists untouched instead — a leaked offset is far
+        // cheaper than a bugcheck, and the caller's `Drop`/reset path can keep
+        // unwinding.
+        if !used {
+            log::error!(
+                "offset-allocator: double free of node {} (offset {}, size {}), ignoring",
+                node_index.to_usize(),
+                offset,
+                size
+            );
+            return;
+        }
 
         if let Some(neighbor_prev) = self.nodes[node_index.to_usize()].neighbor_prev {
             if !self.nodes[neighbor_prev.to_usize()].used {

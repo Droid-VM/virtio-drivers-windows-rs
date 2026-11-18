@@ -1429,6 +1429,12 @@ pub struct VidPnOutput {
     pub modes: Vec<MonitorMode>,
     pub flipq: Arc<ArrayQueue<(Weak<Allocation>, u64)>>,
     pub cursor: SpinMutex<Option<Cursor>>,
+    /// Whether dxgkrnl currently has this source on screen. A remote desktop
+    /// session or a monitor switch clears it; the last address is kept so the
+    /// scanout can be re-armed when the console comes back, because Windows does
+    /// not necessarily send another SetVidPnSourceAddress.
+    pub visible: AtomicBool,
+    pub last_scanout: SpinMutex<Option<(Weak<Allocation>, u64)>>,
     // pub framebuffer: Option<(NonZero<u32>, Box<[u8]>)>, // res_id, buf
 }
 
@@ -1475,6 +1481,8 @@ impl VidPnOutput {
             modes,
             flipq,
             cursor,
+            visible: AtomicBool::new(true),
+            last_scanout: SpinMutex::new(None),
         }
     }
 

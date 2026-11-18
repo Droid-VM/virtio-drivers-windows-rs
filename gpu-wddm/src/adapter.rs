@@ -101,6 +101,17 @@ use crate::{
 
 const PAGE_SIZE: usize = wdk::wdm::PAGE_SIZE as usize;
 
+/// TDR / reset forensics.  `StaleAllocationDestroyed` counts allocations
+/// destroyed after their channel died (should stay a small number: dxgkrnl
+/// only tears the pre-reset set down once), `TDR_COUNT` numbers the resets so
+/// a log excerpt can be attributed to one, and `LAST_SUBMIT_GENERATION` lets
+/// `submit_command` announce the first submission on every new channel - that
+/// first submit is where a host-side reset gap shows up as a fence that never
+/// completes.
+static STALE_ALLOCATIONS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TDR_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LAST_SUBMIT_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 #[macro_export]
 macro_rules! function {
     () => {{
@@ -909,6 +920,16 @@ struct AdapterState {
 
 const VIRTIO_GPU_ADAPTER_TAG: u64 = u64::from_ne_bytes(*b"VGPUADAP");
 
+/// Display state that survives a TDR restart.  See `Adapter::take_display_snapshot`.
+struct DisplaySnapshot {
+    num_scanouts: u8,
+    supported_capsets: CapsetMask,
+    capset_info: [(CapsetInfo, RwLock<Option<Box<[u8]>>>); 64],
+    outputs: [Option<VidPnOutput>; 16],
+    source_target_map: [SmallVec<[D3DDDI_VIDEO_PRESENT_TARGET_ID; 16]>; 16],
+    system_display_info: Option<DXGK_DISPLAY_INFORMATION>,
+}
+
 #[repr(C)]
 #[derive(Tagged)]
 #[tagged(VIRTIO_GPU_ADAPTER_TAG)]
@@ -918,6 +939,10 @@ pub struct Adapter {
     device: NonNull<UnsafeCell<DEVICE_OBJECT>>,
     state: InitOption<AdapterState>,
     flip_timer: Option<FlipTimer>,
+    /// Display state captured in `reset_from_timeout`, consumed by
+    /// `restart_from_timeout`. `reset` drops `state`, so the snapshot has to
+    /// live on the adapter for the gap between the two callbacks.
+    pending_display: Option<DisplaySnapshot>,
     /// Callback data needed to rebuild the transport after a TDR reset.
     start_info: Option<DXGK_START_INFO>,
     start_interface: Option<DXGKRNL_INTERFACE>,
@@ -1032,6 +1057,7 @@ impl Adapter {
             device: device,
             state <- InitOption::none(),
             flip_timer: None,
+            pending_display: None,
             start_info: None,
             start_interface: None,
         }? NtStatus)
@@ -1139,6 +1165,42 @@ impl Adapter {
     }
 
     pub fn start(&mut self, start_info: &DXGK_START_INFO, interface: DXGKRNL_INTERFACE) -> Result<u8, NtStatus> {
+        self.start_impl(start_info, interface, None)
+    }
+
+    /// Everything a TDR restart must keep: the OS owns the VidPn, and
+    /// re-querying it (`GET_CAPSET_INFO`, `GET_DISPLAY_INFO`, `GET_EDID` per
+    /// scanout) costs several blocking control-queue round-trips that the TDR
+    /// recovery deadline cannot afford - especially when the host is the thing
+    /// that stopped answering. `VidPnOutput` is CPU-side state only, so it can
+    /// be reused as-is; the per-scanout cursors do own host framebuffers on the
+    /// old channel and are dropped before the snapshot is taken.
+    fn empty_capset_info() -> [(CapsetInfo, RwLock<Option<Box<[u8]>>>); 64] {
+        core::array::from_fn(|_| (CapsetInfo::default(), RwLock::new(None)))
+    }
+
+    fn take_display_snapshot(&mut self) -> Option<DisplaySnapshot> {
+        let state = self.state.as_mut()?;
+
+        for output in state.outputs.iter_mut().flatten() {
+            // Cursors cache a Framebuffer created on the old channel.
+            *output.cursor.lock() = None;
+            // Flip queues reference allocations that the reset is about to
+            // invalidate; drop them instead of presenting stale addresses.
+            while output.flipq.pop().is_some() {}
+        }
+
+        Some(DisplaySnapshot {
+            num_scanouts: state.num_scanouts,
+            supported_capsets: state.supported_capsets,
+            capset_info: core::mem::replace(&mut state.capset_info, Self::empty_capset_info()),
+            outputs: core::mem::replace(&mut state.outputs, [const { None }; 16]),
+            source_target_map: core::mem::replace(&mut state.source_target_map, core::array::from_fn(|_| SmallVec::new())),
+            system_display_info: state.system_display_info.take(),
+        })
+    }
+
+    fn start_impl(&mut self, start_info: &DXGK_START_INFO, interface: DXGKRNL_INTERFACE, reuse: Option<DisplaySnapshot>) -> Result<u8, NtStatus> {
         crate::bringup::record("StartStage", 1);
         trace!("{}", function!());
 
@@ -1241,13 +1303,19 @@ impl Adapter {
 
         crate::bringup::record("StartStage", 7);
 
+        // A restart reuses the display configuration dxgkrnl already owns.
+        let reuse_display = reuse.is_some();
+        // Resolve up front: `init!` takes its field expressions by value.
+        let reuse_scanouts = reuse.as_ref().map(|snapshot| snapshot.num_scanouts).unwrap_or(num_scanouts);
+        let reuse_capsets = reuse.as_ref().map(|snapshot| snapshot.supported_capsets).unwrap_or_default();
+
         self.state.write_init(init!(AdapterState {
             luid,
-            num_scanouts,
+            num_scanouts: reuse_scanouts,
             is_vga,
             is_msi,
             negotiated_features,
-            supported_capsets: CapsetMask::default(),
+            supported_capsets: reuse_capsets,
             capset_info <- init_array_from_fn(|_| (CapsetInfo::default(), RwLock::new(None))),
             queue_handler <- QueueHandler::new(pci_transport, pci_root.configuration_access, *negotiated_features, shmem),
             max_simultaneously_running_commands <- init_array_from_fn(|_| AtomicU32::new(0)),
@@ -1257,72 +1325,118 @@ impl Adapter {
             source_target_map <- init_array_from_fn(|_| SmallVec::new()),
         }? NtStatus))?;
 
-        let state = self.state.as_mut().unwrap();
-        crate::bringup::record("StartStage", 8);
-        state.queue_handler.start_handler_thread()?;
-        crate::bringup::record("StartStage", 9);
-        let chan = state.queue_handler.channel();
-
-        let (supported_capsets, capset_info) = chan.get_capset_infos(num_capsets)?;
-        crate::bringup::record("StartStage", 10);
-
-        state.supported_capsets = supported_capsets;
-        state.capset_info = capset_info.map(|i| (i, RwLock::new(None)));
-
-        let display_modes = chan.get_display_info()?;
-        crate::bringup::record("StartStage", 11);
-
-        let mut rects = [commands::Rect { width: 0, height: 0, x: 0, y: 0}; 16];
-        let mut flipq = [const { None }; 16];
-        let addrs = [const { AtomicU64::new(0) }; 16];
-        let vsync_enabled = AtomicBool::new(false);
-        let mut refresh_rates = [0u32; 16];
-        //let addrs = [const { (AtomicU64::new(0), AtomicPtr::new(null_mut())) }; 16];
-
-        for scanout in 0..(num_scanouts as usize) {
-            let edid = chan.get_edid(scanout as _)?;
-            let _ = map_virtio_error!(edid.preferred_resolution())?;
-
-            let info = VidPnOutput::new(display_modes[scanout], edid);
-            refresh_rates[scanout] = info.modes[0].refresh_rate;
-
-            debug!("scanout {}: {:?}", scanout, info);
-            for (i, mode) in info.modes.iter().enumerate() {
-                debug!("mode {}: {:?}", i, mode);
+        {
+            let state = self.state.as_mut().unwrap();
+            if let Some(snapshot) = reuse {
+                state.supported_capsets = snapshot.supported_capsets;
+                state.capset_info = snapshot.capset_info;
+                state.outputs = snapshot.outputs;
+                state.source_target_map = snapshot.source_target_map;
+                state.system_display_info = snapshot.system_display_info;
             }
-            rects[scanout] = info.rect;
-            flipq[scanout] = Some(info.flipq.clone());
-            state.outputs[scanout] = Some(info);
+            crate::bringup::record("StartStage", 8);
+            state.queue_handler.start_handler_thread()?;
+        }
+        crate::bringup::record("StartStage", 9);
+
+        if reuse_display {
+            crate::bringup::record("TdrRestartMode", 2);
+            let scanouts = self.restore_display_after_restart()?;
+            let generation = self.state.as_ref()
+                .map(|state| state.queue_handler.channel().generation())
+                .unwrap_or(0);
+            info!(
+                "{}: restarted on channel generation {} without re-enumerating the display ({} scanouts)",
+                function!(), generation, scanouts
+            );
+            return Ok(scanouts);
         }
 
-        state.empty_cursor = Some(Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0)?);
-        crate::bringup::record("StartStage", 12);
+        let timer = {
+            let state = self.state.as_mut().unwrap();
+            let chan = state.queue_handler.channel();
 
-        // TODO: allocate Framebuffer for this
-        //if state.system_display_info.is_none() {
-        //    state.system_display_info = Some(DXGK_DISPLAY_INFORMATION {
-        //        Width: rects[0].width as _,
-        //        Height: rects[0].height as _,
-        //        Pitch: (rects[0].width * 4) as _,
-        //        ColorFormat: D3DDDIFORMAT::D3DDDIFMT_X8R8G8B8,
-        //        PhysicAddress: 0,
-        //        TargetId: 0,
-        //        AcpiId: 0,
-        //    });
-        //}
+            let (supported_capsets, capset_info) = chan.get_capset_infos(num_capsets)?;
+            crate::bringup::record("StartStage", 10);
 
-        // DEBUG => false
-        //if false {
-        if true {
+            state.supported_capsets = supported_capsets;
+            state.capset_info = capset_info.map(|i| (i, RwLock::new(None)));
+
+            let display_modes = chan.get_display_info()?;
+            crate::bringup::record("StartStage", 11);
+
+            for scanout in 0..(num_scanouts as usize) {
+                let edid = chan.get_edid(scanout as _)?;
+                let _ = map_virtio_error!(edid.preferred_resolution())?;
+
+                let info = VidPnOutput::new(display_modes[scanout], edid);
+                debug!("scanout {}: {:?}", scanout, info);
+                for (i, mode) in info.modes.iter().enumerate() {
+                    debug!("mode {}: {:?}", i, mode);
+                }
+                state.outputs[scanout] = Some(info);
+            }
+
+            state.empty_cursor = Some(Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0)?);
+            crate::bringup::record("StartStage", 12);
+
+            if is_vga {
+                state.system_display_info = Some(state.queue_handler.dxgk_interface().acquire_post_display_ownership()?);
+            }
+
+            Self::build_flip_timer(chan, &state.outputs, num_scanouts)?
+        };
+
+        self.flip_timer = Some(timer);
+        Ok(num_scanouts)
+    }
+
+    /// Restart tail: rebuild only the host objects that died with the old
+    /// channel (cursor + flip timer). The display configuration itself comes
+    /// from the snapshot and must not be re-queried - those are blocking
+    /// control-queue round-trips, and the host is often the thing that stalled.
+    fn restore_display_after_restart(&mut self) -> Result<u8, NtStatus> {
+        let state = self.state.as_mut().ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
+        let chan = state.queue_handler.channel();
+
+        // Best effort: a cursor is not worth failing the TDR recovery over.
+        match Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0) {
+            Ok(cursor) => state.empty_cursor = Some(cursor),
+            Err(status) => {
+                warn!("{}: cursor recreation failed: {:?}", function!(), status);
+                state.empty_cursor = None;
+            },
+        }
+
+        let timer = Self::build_flip_timer(chan, &state.outputs, state.num_scanouts)?;
+        let num_scanouts = state.num_scanouts;
+        self.flip_timer = Some(timer);
+
+        Ok(num_scanouts)
+    }
+
+    /// Flip timer over the scanouts that currently exist. Used by both the full
+    /// start path and the TDR restart path, so the two can never drift.
+    fn build_flip_timer(chan: GpuChannel, outputs: &[Option<VidPnOutput>; 16], num_scanouts: u8) -> Result<FlipTimer, NtStatus> {
+        let mut rects = [commands::Rect { width: 0, height: 0, x: 0, y: 0 }; 16];
+        let mut flipq = [const { None }; 16];
+        let mut refresh_rates = [0u32; 16];
+
+        for scanout in 0..(num_scanouts as usize).min(16) {
+            let Some(output) = outputs[scanout].as_ref() else { continue };
+            rects[scanout] = output.rect;
+            flipq[scanout] = Some(output.flipq.clone());
+            refresh_rates[scanout] = output.modes.first().map(|mode| mode.refresh_rate).unwrap_or(60);
+        }
 
         let flip_timer = FlipTimer::try_new(FlipTimerContext {
             timer_rate: refresh_rates.iter().copied().max().unwrap_or(60).max(1) as u8,
             refresh_rates,
             refresh_phases: [const { AtomicU64::new(0) }; 16],
             rects,
-            addrs,
+            addrs: [const { AtomicU64::new(0) }; 16],
             flipq,
-            vsync_enabled,
+            vsync_enabled: AtomicBool::new(false),
             chan,
         }).inspect_err(|e|
             error!("{}: failed to create flip timer: {:?}", function!(), e)
@@ -1332,19 +1446,7 @@ impl Adapter {
             error!("{}: failed to start flip timer: {:?}", function!(), e)
         )?;
 
-        self.flip_timer = Some(flip_timer);
-
-        if is_vga {
-            state.system_display_info = Some(state.queue_handler.dxgk_interface().acquire_post_display_ownership()?);
-        }
-
-        //Err(NtStatus(STATUS::UNSUCCESSFUL))
-
-        Ok(num_scanouts)
-
-        } else {
-        Ok(0)
-        }
+        Ok(flip_timer)
     }
 
     pub fn query_info(&self, query_info: &DXGKARG_QUERYADAPTERINFO) -> Result<(), NtStatus> {
@@ -1957,11 +2059,20 @@ impl Adapter {
     pub fn stop(&mut self) -> Result<(), NtStatus> {
         trace!("{}", function!());
 
+        // The flips are about to be dropped with the timer. Clear them first so
+        // the host never keeps scanning a surface this driver is tearing down.
+        if let Some(state) = self.state.as_ref() {
+            for source in 0..state.source_target_map.len() as u32 {
+                let _ = self.disable_scanout(source);
+            }
+        }
+
         let result = if let Some(flip_timer) = self.flip_timer.take() {
             flip_timer.stop()
         } else {
             Ok(())
         };
+        self.pending_display = None;
         // take would overflow the stack lol, safe language btw
         self.state.clear();
 
@@ -1973,6 +2084,29 @@ impl Adapter {
     /// buffers.
     pub fn reset_from_timeout(&mut self) -> Result<(), NtStatus> {
         crate::bringup::record("TdrResetStage", 1);
+
+        // Forensic snapshot of the channel that is about to die.  Taken before
+        // `begin_reset()` + `state.clear()` so the fences still describe the
+        // work that timed out; registered (PASSIVE_LEVEL) and logged, because
+        // the ring buffer may wrap before anyone reads the dump.
+        let tdr = TDR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::bringup::record("TdrCount", tdr);
+        if let Some(state) = self.state.as_ref() {
+            let generation = state.queue_handler.channel().generation();
+            crate::bringup::record("TdrGeneration", generation as u32);
+            for node_ordinal in 0..Engine::TOTAL_COUNT {
+                let engine = Engine::try_from_node_ordinal(node_ordinal).unwrap();
+                let submitted = state.queue_handler.last_submitted_fence(engine);
+                let completed = state.queue_handler.last_completed_fence(engine);
+                info!(
+                    "{}: TDR #{} generation {}: engine {:?} submitted {} completed {}",
+                    function!(), tdr, generation, engine, submitted, completed
+                );
+                crate::bringup::record(&alloc::format!("TdrGen{node_ordinal}Submitted"), submitted);
+                crate::bringup::record(&alloc::format!("TdrGen{node_ordinal}Completed"), completed);
+            }
+        }
+
         info!("{}: beginning adapter reset", function!());
 
         crate::bringup::record("TdrResetStage", 2);
@@ -1988,6 +2122,11 @@ impl Adapter {
             state.queue_handler.begin_reset();
             crate::bringup::record("TdrResetStage", 5);
         }
+
+        // Keep the display configuration across the state teardown: the OS owns
+        // the VidPn and re-querying it is what used to blow the TDR deadline.
+        self.pending_display = self.take_display_snapshot();
+
         self.state.clear();
         crate::bringup::record("TdrResetStage", 6);
 
@@ -2008,8 +2147,37 @@ impl Adapter {
         let start_info = self.start_info.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
         let interface = self.start_interface.ok_or(NtStatus(STATUS::REINITIALIZATION_NEEDED))?;
         crate::bringup::record("TdrRestartStage", 31);
-        let result = self.start(&start_info, interface);
+
+        // Keep the VidPn: re-querying it (capsets, display info, EDID per
+        // scanout) is several blocking control-queue round-trips, and dxgkrnl
+        // measures the TDR recovery in seconds.
+        let snapshot = self.pending_display.take();
+        crate::bringup::record("TdrRestartMode", if snapshot.is_some() { 2 } else { 1 });
+
+        let (t0, freq) = wdk::wdm::ke_query_performance_counter();
+        // Recovery must fail fast if the host is wedged: 750 ms per request
+        // instead of the usual 5 s.
+        let result = {
+            let _fast_timeout = crate::queue::BlockingTimeoutGuard::new(750);
+            self.start_impl(&start_info, interface, snapshot)
+        };
         crate::bringup::record("TdrRestartStage", 32);
+
+        let elapsed_ms = ((wdk::wdm::ke_query_performance_counter().0 - t0) * 1000).checked_div(freq.max(1)).unwrap_or(0);
+        crate::bringup::record("TdrRestartMs", elapsed_ms.min(u32::MAX as u64) as u32);
+        if elapsed_ms > 3_000 {
+            warn!("{}: restart took {} ms (TDR deadline is seconds)", function!(), elapsed_ms);
+        }
+
+        if result.is_ok() {
+            // Announce the new id space: everything dxgkrnl still holds from
+            // before this point is stale by construction.
+            let generation = self.state.as_ref()
+                .map(|state| state.queue_handler.channel().generation())
+                .unwrap_or(0);
+            info!("{}: adapter restarted on channel generation {} in {} ms", function!(), generation, elapsed_ms);
+            crate::bringup::record("TdrRestartGeneration", generation as u32);
+        }
         result
     }
 
@@ -2138,6 +2306,20 @@ impl Adapter {
 
         debug!("{}: DmaSubmit({:?}, {})", function!(), engine, submit_command.SubmissionFenceId);
         //info!("{}: engine {:?}: {:?}", function!(), engine, submit_command);
+
+        // First submission on a freshly restarted channel: if the host-side
+        // reset left the device wedged, this fence is the one that will never
+        // complete, so make it easy to find in the log.
+        let generation = chan.generation();
+        let pending = fence.wrapping_sub(state.queue_handler.last_completed_fence(engine));
+        if LAST_SUBMIT_GENERATION.swap(generation, Ordering::Relaxed) != generation {
+            info!(
+                "{}: first DmaSubmit on channel generation {}: engine {:?} fence {} pending {}",
+                function!(), generation, engine, fence, pending
+            );
+            crate::bringup::record("FirstSubmitFenceAfterRestart", fence);
+            crate::bringup::record("FirstSubmitGeneration", generation as u32);
+        }
 
         let simultaneously_running_commands = fence - state.queue_handler.last_completed_fence(engine);
         let max_simultaneously_running_commands = state.max_simultaneously_running_commands[engine.node_ordinal() as usize].fetch_max(simultaneously_running_commands, Ordering::SeqCst);
@@ -2723,6 +2905,10 @@ impl Adapter {
             },
         }?;
 
+        // Remember which channel generation produced this host resource; the
+        // destroy path uses it to decide whether the host still knows the id.
+        allocation.set_generation(chan.generation());
+
         if alloc_priv.tag() == ALLOCATE_3D_TAG
             && alloc_info.PrivateDriverDataSize as usize == size_of::<crate::allocation::StandardAllocationData>()
         {
@@ -2796,29 +2982,54 @@ impl Adapter {
 
         //warn!("Destroying allocation: {:?}", alloc);
 
-        if alloc.is_mapped() {
-            debug!("{}: unmapping blob: {:?}", function!(), alloc);
-            let offset = match alloc.resource() {
-               VirtioResource::Sysmem { .. } => return,
-               VirtioResource::_3D {..} => {
-                   unreachable!()
-               },
-               VirtioResource::Blob {map, ..} => {
-                   map.read().unwrap()
-               },
-            };
+        // A TDR reset replaced the channel (and its host resource table) after
+        // this allocation was created. Its resource id, BAR mapping and context
+        // attachment all belong to that dead generation; the new channel's id
+        // space starts over at 1, so unref/unmap with a stale id can act on a
+        // live resource and, worse, blocks on a queue that will never answer.
+        // Drop the local bookkeeping and nothing else.
+        if alloc.generation() != chan.generation() {
+            crate::bringup::count("StaleAllocationDestroyed", &STALE_ALLOCATIONS);
+            if let VirtioResource::Blob { map, .. } = alloc.resource() {
+                // The token is Copy: dropping the Option drops the mapping
+                // record, not the allocator node (which stays in the dead
+                // channel's allocator).
+                let _ = map.write().take();
+            }
+            alloc.set_mapped(false);
+            debug!(
+                "{}: dropping allocation {} without host teardown (generation {} != {})",
+                function!(), id, alloc.generation(), chan.generation()
+            );
+            return;
+        }
 
-            /*if let Some((offset, size)) = alloc.mapped_range() {
-                let (shmem_start, _) = chan.get_shmem_slice();
-                let phys =  shmem_start + offset;
-                let mdl = MdlOwned::from_physical_range(phys, size)?;
-                //debug!("{}: Unmapped {:X} (offset {:X}) from address {:?}: {:?}", function!(), { blob_map.handle }, offset, ptr, alloc);
-                mm_unmap_locked_pages(&mdl, ptr);
-            }*/
-
-            let _ = chan.resource_unmap_blob(id, offset.0).inspect_err(|e|
+        // Take the BAR mapping out of the allocation unconditionally.  The old
+        // code called `chan.resource_unmap_blob()` but left the token (and the
+        // mapped flag) in place, so any later unmap of the same allocation
+        // freed the same offset-allocator node twice.  The token is also
+        // tagged with the channel generation that produced it: after a TDR
+        // reset `chan` is a brand new channel with a brand new allocator, and
+        // handing it a pre-reset token made it free a node it never allocated
+        // -> `assert!(used)` in offset-allocator -> panic -> 0xDEADDEAD.
+        let blob_map = match alloc.resource() {
+            VirtioResource::Sysmem { .. } => None,
+            VirtioResource::_3D { .. } => None,
+            VirtioResource::Blob { map, .. } => map.write().take(),
+        };
+        if let Some((handle, _)) = blob_map {
+            if alloc.is_mapped() {
+                debug!("{}: unmapping blob: {:?}", function!(), alloc);
+            }
+            alloc.set_mapped(false);
+            let _ = chan.resource_unmap_blob(id, handle).inspect_err(|e|
                 error!("failed to unmap blob resource {}: {:?}", id, e)
             );
+        } else if alloc.is_mapped() {
+            // Flag set but no token: only possible after a failed/partial map
+            // of an older driver.  Clear it instead of panicking later.
+            warn!("{}: allocation marked mapped without a BAR token: {:?}", function!(), alloc);
+            alloc.set_mapped(false);
         }
 
         let result = if let Some(backing) = alloc.guest_backing_owner() {
@@ -3079,7 +3290,13 @@ impl Adapter {
             }
         } else {
             for &scanout in targets {
-                state.outputs[scanout as usize].as_ref().unwrap().hide_cursor(scanout, &chan, state.empty_cursor.as_ref().unwrap())?;
+                // The empty cursor is created on the live channel; after a TDR
+                // restart it can legitimately be missing (host still wedged).
+                let Some(empty_cursor) = state.empty_cursor.as_ref() else {
+                    debug!("{}: no empty cursor, skipping hide on scanout {}", function!(), scanout);
+                    continue;
+                };
+                state.outputs[scanout as usize].as_ref().unwrap().hide_cursor(scanout, &chan, empty_cursor)?;
             }
         }
 
@@ -3144,15 +3361,95 @@ impl Adapter {
         }
     }
 
+    /// Stop scanning a source out without touching its VidPn state. Used when
+    /// dxgkrnl takes the display away: a remote desktop session, a monitor
+    /// switch, or the driver being stopped for an update. The pending flips
+    /// are dropped instead of being re-armed against a surface the OS may free.
+    pub fn disable_scanout(&self, source: D3DDDI_VIDEO_PRESENT_SOURCE_ID) -> Result<(), NtStatus> {
+        trace!("{}: source {}", function!(), source);
+        let state = check_state!(self)?;
+        let targets = self.targets_for_source(source)?;
+
+        for &scanout in targets {
+            let Some(output) = state.outputs.get(scanout as usize).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            if let Err(status) = state.queue_handler.channel().clear_scanout(scanout) {
+                warn!("{}: scanout {}: failed to clear host scanout: {:?}", function!(), scanout, status);
+            }
+            *output.last_scanout.lock() = None;
+            output.visible.store(false, Ordering::Release);
+            let mut dropped = 0u32;
+            while output.flipq.pop().is_some() {
+                dropped += 1;
+            }
+            if dropped != 0 {
+                debug!("{}: scanout {}: dropped {} pending flips", function!(), scanout, dropped);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Track the display on/off transitions that a remote desktop session or a
+    /// monitor switch produces. Hiding the source must stop the scanout, but the
+    /// last address has to survive so showing it again re-arms the scanout:
+    /// Windows does not always send a fresh SetVidPnSourceAddress, and without
+    /// one the desktop never comes back and every presenting client stalls.
+    pub fn set_scanout_visible(&self, source: D3DDDI_VIDEO_PRESENT_SOURCE_ID, visible: bool) -> Result<(), NtStatus> {
+        trace!("{}: source {} visible {}", function!(), source, visible);
+        let state = check_state!(self)?;
+        let targets = self.targets_for_source(source)?;
+
+        for &scanout in targets {
+            let Some(output) = state.outputs.get(scanout as usize).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            if visible {
+                output.visible.store(true, Ordering::Release);
+                let last = output.last_scanout.lock().clone();
+                match last {
+                    Some((alloc, addr)) if alloc.strong_count() != 0 => {
+                        if let Some((_, dropped)) = output.flipq.force_push((alloc, addr)) {
+                            warn!("{}: scanout {}: dropped scanout on re-arm: {:?}", function!(), scanout, dropped);
+                        }
+                        info!("{}: scanout {}: re-armed after display switch", function!(), scanout);
+                    },
+                    _ => {
+                        debug!("{}: scanout {}: no scanout to re-arm", function!(), scanout);
+                    },
+                }
+            } else {
+                output.visible.store(false, Ordering::Release);
+                while output.flipq.pop().is_some() {}
+                if let Err(status) = state.queue_handler.channel().clear_scanout(scanout) {
+                    warn!("{}: scanout {}: failed to clear host scanout: {:?}", function!(), scanout, status);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn queue_scanout(&self, source: D3DDDI_VIDEO_PRESENT_SOURCE_ID, alloc: &Arc<Allocation>, addr: u64) -> Result<(), NtStatus> {
         trace!("{}", function!());
         let state = check_state!(self)?;
         let targets = self.targets_for_source(source)?;
 
         for &scanout in targets {
+            let Some(output) = state.outputs.get(scanout as usize).and_then(|o| o.as_ref()) else {
+                continue;
+            };
             let weak = Arc::downgrade(alloc);
-            if let Some((dropped_addr, dropped_alloc)) = state.outputs[scanout as usize].as_ref().unwrap().flipq.force_push((weak, addr)) {
-                warn!("{}: dropped scanout: {:?}", function!(), dropped_alloc);
+            // Remember it even while the source is hidden, so the display can be
+            // re-armed without waiting for another address change.
+            *output.last_scanout.lock() = Some((weak.clone(), addr));
+            if !output.visible.load(Ordering::Acquire) {
+                debug!("{}: scanout {}: source hidden, not scanning out", function!(), scanout);
+                continue;
+            }
+            if let Some((dropped_addr, dropped_alloc)) = output.flipq.force_push((weak, addr)) {
+                warn!("{}: dropped scanout: {:?} at {:?}", function!(), dropped_alloc, dropped_addr);
             }
         }
 
@@ -3208,9 +3505,15 @@ impl Adapter {
             return Err(NtStatus(STATUS::INVALID_PARAMETER));
         };
 
-        check_vidpn_source_mode(&pinned_mode_info).inspect_err(|e|
-            error!("{}: pinned mode info is invalid: {:?}", function!(), e)
-        )?;
+        // A remote session or a mode switch can present a source mode we did not
+        // advertise, or one that differs in format. Rejecting the commit leaves
+        // the system without a display at all (and every presenting client
+        // frozen), which is worse than accepting it: this is a virtual scanout,
+        // the host scales whatever we give it.
+        if let Err(status) = check_vidpn_source_mode(&pinned_mode_info) {
+            warn!("{}: accepting unusual source mode ({:?})", function!(), status);
+            crate::bringup::record("CommitVidpnOddMode", 1);
+        }
 
         let (width, height) = {
             let graphics = unsafe { &pinned_mode_info.Format.Graphics };
@@ -3236,19 +3539,37 @@ impl Adapter {
                 error!("{}: failed to get path info for source {}, target {}: {:?}", function!(), commit.AffectedVidPnSourceId, target, e)
             )?;
 
-            check_vidpn_present_path(state.num_scanouts, &path_info).inspect_err(|e|
-                error!("{}: invalid path info for source {}, target {}: {:?}", function!(), commit.AffectedVidPnSourceId, target, e)
-            )?;
+            // Same reasoning as the source mode above: refusing the path only
+            // removes the display. Record it and carry on.
+            if let Err(status) = check_vidpn_present_path(state.num_scanouts, &path_info) {
+                warn!("{}: accepting unusual present path for source {} target {} ({:?})", function!(), commit.AffectedVidPnSourceId, target, status);
+                crate::bringup::record("CommitVidpnOddPath", 1);
+            }
 
             targets.push(target);
             let output = state.outputs[target as usize].as_mut().ok_or(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_TARGET)?;
 
-            let Some(current_mode) = output.modes.iter().position(|mode| mode.width == width && mode.height == height) else {
-                error!("{}: mode {}x{} does not exist on target {}", function!(), width, height, target);
-                return Err(NtStatus(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE_MODE));
+            // Unknown size (typical when a remote desktop session resizes the
+            // desktop). A virtual display should simply support it.
+            let current_mode = match output.modes.iter().position(|mode| mode.width == width && mode.height == height) {
+                Some(index) => index,
+                None => {
+                    warn!("{}: mode {}x{} was not advertised by target {}, adding it", function!(), width, height, target);
+                    output.modes.push(MonitorMode {
+                        width,
+                        height,
+                        refresh_rate: output.modes.first().map(|mode| mode.refresh_rate).unwrap_or(60),
+                    });
+                    crate::bringup::record("CommitVidpnModeAdded", 1);
+                    output.modes.len() - 1
+                },
             };
 
             output.current_mode = Some(current_mode);
+            // Keep the host scanout rectangle in step with the accepted mode.
+            if output.rect.width != width || output.rect.height != height {
+                output.rect = commands::Rect { x: 0, y: 0, width, height };
+            }
         }
 
         state.source_target_map[commit.AffectedVidPnSourceId as usize] = targets;
