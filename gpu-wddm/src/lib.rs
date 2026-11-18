@@ -62,6 +62,7 @@ mod vidpn;
 mod process;
 mod bringup;
 mod boot_pool;
+mod present_dump;
 mod guest_backing;
 
 // TODO: update tag to invalid for all tagged structs on drop
@@ -1059,7 +1060,13 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
             }
 
             build_paging_buffer.pDmaBuffer = unsafe { build_paging_buffer.pDmaBuffer.byte_add(needed) };
-            let chan = gpu.queue_channel().unwrap();
+            // The channel can be gone mid-reset (TDR / display switch); a paging
+            // operation arriving then must not panic the driver. Tell dxgkrnl to
+            // retry once the adapter has been restarted.
+            let Some(chan) = gpu.queue_channel() else {
+                error!("{}: channel not available during map-aperture (resetting?)", function!());
+                return STATUS::REINITIALIZATION_NEEDED.to_u32();
+            };
             let (detach_dma, attach_dma) = dmabuf.split_at_mut(detach_len);
             let detach = Command::detach_backing(&chan, res_id, detach_dma);
             let attach = Command::attach_backing(&chan, res_id, mdl, page_offset, n_pages, attach_dma);
@@ -1097,7 +1104,11 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
             }
 
             build_paging_buffer.pDmaBuffer = unsafe { build_paging_buffer.pDmaBuffer.byte_add(needed) };
-            let cmd = Command::detach_backing(&gpu.queue_channel().unwrap(), res_id, dmabuf);
+            let Some(chan) = gpu.queue_channel() else {
+                error!("{}: channel not available during detach (resetting?)", function!());
+                return STATUS::REINITIALIZATION_NEEDED.to_u32();
+            };
+            let cmd = Command::detach_backing(&chan, res_id, dmabuf);
 
             trace!("{} ({:?}): writing {:?} to {:?} (resource {})", function!(), build_paging_buffer.Operation, cmd, build_paging_buffer.pDmaBufferPrivateData, res_id);
 
@@ -1105,7 +1116,7 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
                 dma_priv.commands.push(cmd);
             } else {
                 build_paging_buffer.pDmaBuffer = dmabuf.as_ptr() as _;
-                if let Err(e) = gpu.queue_channel().unwrap().submit_command_sync(&cmd) {
+                if let Err(e) = chan.submit_command_sync(&cmd) {
                     error!("{} ({:?}): failed to submit: {:?}", function!(), build_paging_buffer.Operation, e);
                 }
             }
@@ -1220,7 +1231,11 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
                     }
 
                     build_paging_buffer.pDmaBuffer = unsafe { build_paging_buffer.pDmaBuffer.byte_add(needed) };
-                    let Some(cmd) = Command::attach_backing_virtual(&gpu.queue_channel().unwrap(), &alloc, dmabuf) else {
+                    let Some(chan) = gpu.queue_channel() else {
+                        error!("{}: channel not available during attach (resetting?)", function!());
+                        return STATUS::REINITIALIZATION_NEEDED.to_u32();
+                    };
+                    let Some(cmd) = Command::attach_backing_virtual(&chan, &alloc, dmabuf) else {
                         error!("{}: failed to attach backing for {:?}", function!(), alloc);
                         return STATUS::INVALID_PARAMETER.to_u32();
                     };
@@ -1395,7 +1410,7 @@ unsafe extern "C" fn create_context(device: HANDLE, create_context: *mut DXGKARG
         /* Honor VirtualAddressing only for engines that already advertise
          * GpuMmuSupported (Copy / Other). Graphics must stay a 1 MB physical
          * DMA context: 979 honoured the flag for 3D as well and BSODed
-         * (gpu-stats-plan.md §11.5). */
+         * (gpu-stats-plan.md 搂11.5). */
         match engine {
             Engine::Graphics | Engine::PhysicalOther => {
                 create_context.hContext = TaggedExt::into_arc_handle(context);
@@ -1603,7 +1618,19 @@ unsafe extern "C" fn enum_vidpn_cofunc_modality(adapter: HANDLE, enum_cofunc_mod
 }
 
 unsafe extern "C" fn set_vidpn_source_visibility(adapter: HANDLE, set_vidpn_source_visibility: *const DXGKARG_SETVIDPNSOURCEVISIBILITY) -> NTSTATUS {
-    debug!("{}: not implemented", function!());
+    trace!("{}", function!());
+
+    let gpu = check_handle!(adapter: Adapter);
+    let arg = check_arg!(set_vidpn_source_visibility);
+
+    // A remote desktop session, a monitor switch or a session change hides the
+    // source. Stop scanning it out, but keep the last address: when the console
+    // comes back Windows does not always send another SetVidPnSourceAddress, so
+    // showing the source has to re-arm the scanout itself. Without that the
+    // desktop never returns and every presenting client hangs.
+    if let Err(status) = gpu.set_scanout_visible(arg.VidPnSourceId, arg.Visible != 0) {
+        warn!("{}: failed to update scanout visibility for {}: {:?}", function!(), arg.VidPnSourceId, status);
+    }
 
     STATUS::SUCCESS.to_u32()
 }
@@ -1613,8 +1640,24 @@ unsafe extern "C" fn set_vidpn_source_address(adapter: HANDLE, set_vidpn_source_
 
     let gpu = check_handle!(adapter: Adapter);
     let set_vidpn_source_address = check_arg!(set_vidpn_source_address);
-    let alloc = check_handle_arc!(set_vidpn_source_address.hAllocation: Allocation);
     let source = set_vidpn_source_address.VidPnSourceId;
+
+    // dxgkrnl passes a null allocation when the source stops being displayed
+    // (display off, remote desktop takeover, driver stop). Returning
+    // INVALID_PARAMETER here leaves the machine without a working display until
+    // it is rebooted, so treat it as "stop scanning out".
+    if set_vidpn_source_address.hAllocation.is_null() {
+        info!("{}: source {}: display detached", function!(), source);
+        return match gpu.disable_scanout(source) {
+            Ok(()) => STATUS::SUCCESS,
+            Err(status) => {
+                error!("{}: failed to disable scanout {}: {:?}", function!(), source, status);
+                status.0
+            },
+        }.to_u32();
+    }
+
+    let alloc = check_handle_arc!(set_vidpn_source_address.hAllocation: Allocation);
     let seg = set_vidpn_source_address.PrimarySegment;
     let addr = unsafe { set_vidpn_source_address.PrimaryAddress.QuadPart } as u64;
 

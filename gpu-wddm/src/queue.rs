@@ -723,6 +723,31 @@ struct Queue<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize
 
 const DEFAULT_BLOCKING_TIMEOUT: NtTime = NtTime::relative_ms(5_000);
 
+/// Default wait for a control-queue response.  Overridable because the TDR
+/// restart path must fail fast: when the host is the thing that stalled, every
+/// 5 s wait burns the recovery budget dxgkrnl measures us against.
+static BLOCKING_TIMEOUT_MS: AtomicU32 = AtomicU32::new(5_000);
+
+fn blocking_timeout() -> NtTime {
+    NtTime::relative_ms(BLOCKING_TIMEOUT_MS.load(Ordering::Relaxed).clamp(50, 60_000))
+}
+
+/// Sets the control-queue timeout for as long as the guard lives.
+pub struct BlockingTimeoutGuard(u32);
+
+impl BlockingTimeoutGuard {
+    pub fn new(ms: u32) -> Self {
+        let previous = BLOCKING_TIMEOUT_MS.swap(ms.clamp(50, 60_000), Ordering::Relaxed);
+        Self(previous)
+    }
+}
+
+impl Drop for BlockingTimeoutGuard {
+    fn drop(&mut self) {
+        BLOCKING_TIMEOUT_MS.store(self.0, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct QueueChannel<const IN: usize, const OUT: usize>(Pin<Arc<AsyncQueue<Buffer<IN, OUT>>>>);
 
@@ -774,7 +799,7 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
 
     pub fn request_blocking_into_buf<Req: IntoBytes + Immutable + KnownLayout>(&self, req: Req, output: MaybeInlineBuffer<OUT>) -> Result<MaybeInlineBuffer<OUT>, NtStatus> {
         let input = MaybeInlineBuffer::try_from_value(req)?;
-        self.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)
+        self.request_blocking_buf(input, output, blocking_timeout())
     }
 
     pub fn request_blocking<Req: IntoBytes + Immutable + KnownLayout, Rsp: FromBytes + IntoBytes + KnownLayout>(&self, req: Req) -> Result<Rsp, NtStatus> {
@@ -1709,15 +1734,48 @@ impl FenceSubmission {
         let (now, freq) = ke_query_performance_counter();
 
         let dt = now - self.timestamp;
+        let limit = EngineState::RESPONSIVE_TIMEOUT_SEC * freq;
 
-        if dt >= EngineState::RESPONSIVE_TIMEOUT_SEC * freq {
-            warn!("{}: timeout {:?}: now {}, freq {}, dt {}", function!(), self, now, freq, dt);
+        if dt >= limit {
+            let freq = freq.max(1);
+            warn!(
+                "{}: fence {} (virtio {}) on {:?} timed out after {} ms (limit {} ms)",
+                function!(),
+                self.dxgk_fence,
+                self.virtio_fence,
+                self.engine,
+                dt * 1000 / freq,
+                limit * 1000 / freq,
+            );
             true
         } else {
             false
         }
     }
 }
+
+/// A BAR offset handed out by one specific virtio-gpu channel instance.
+///
+/// The offset allocator lives in [`GpuData`] and is re-created on every
+/// adapter (re)start 閳?including the TDR `restart_from_timeout` path, which
+/// runs while WDDM allocations created before the reset are still alive and
+/// still carry their BAR mapping token.  An `offset_allocator::Allocation` is
+/// only a node index, so freeing a token that was handed out by a previous
+/// channel into the current allocator releases a node that was never
+/// allocated there (or was already freed) and trips the allocator's
+/// double-free check, which ends in `KeBugCheck(0xDEADDEAD)` through the
+/// driver panic handler.  Keep the owning generation next to the token and
+/// never free a token in an allocator that did not create it.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobMapHandle {
+    pub alloc: offset_allocator::Allocation,
+    pub bar_offset: u64,
+    pub generation: u64,
+}
+
+/// Monotonic id assigned to each [`GpuData`] (i.e. each virtio-gpu channel
+/// instance).  See [`BlobMapHandle`].
+static CHANNEL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 struct GpuData {
     guest_alloc_supported: bool,
@@ -1734,6 +1792,8 @@ struct GpuData {
     /// buffers during a reset.
     resetting: AtomicBool,
     reset_epoch: AtomicU64,
+    /// Identifies the allocator/queue instance; see [`BlobMapHandle`].
+    generation: u64,
 
     resource_id: SimpleIdAllocator,
     context_id: SimpleIdAllocator,
@@ -1773,6 +1833,7 @@ impl GpuData {
             shmem,
             resetting: AtomicBool::new(false),
             reset_epoch: AtomicU64::new(0),
+            generation: CHANNEL_GENERATION.fetch_add(1, Ordering::Relaxed),
             resource_id: SimpleIdAllocator::new(1),
             context_id: SimpleIdAllocator::new(1),
             offset_allocator: SpinMutex::new(offset_allocator::Allocator::with_max_allocs(shmem_pages, 1024 * 1024)),
@@ -1794,6 +1855,21 @@ impl GpuData {
     }
 
     fn begin_reset(&self) {
+        // Snapshot what the reset is about to throw away: outstanding Dxgk
+        // fences per engine and virtio fences the host never signalled.  A
+        // non-zero virtio count after a restart is the smoking gun for "host
+        // stopped answering", a zero count points at the guest submit path.
+        let unsignaled = self.fence.unsignaled.read().len();
+        let pending: usize = self.engines.iter().map(|engine| engine.pending_fences.lock().len()).sum();
+        if unsignaled != 0 || pending != 0 {
+            warn!(
+                "{}: reset with {} virtio fences unsignalled, {} dxgk fences pending",
+                function!(), unsignaled, pending
+            );
+        }
+        crate::bringup::record("TdrUnsignalledFences", unsignaled as u32);
+        crate::bringup::record("TdrPendingFences", pending as u32);
+
         self.reset_epoch.fetch_add(1, Ordering::AcqRel);
         self.resetting.store(true, Ordering::Release);
     }
@@ -2005,6 +2081,19 @@ pub struct GpuChannel {
 }
 
 impl GpuChannel {
+    /// Identity of the offset allocator behind this channel.  A
+    /// [`BlobMapHandle`] may only be released through a channel with the same
+    /// generation.
+    pub fn generation(&self) -> u64 {
+        self.data.generation
+    }
+
+    /// True once `begin_reset()` ran on this channel: the queues are closed and
+    /// the host resource/context tables were dropped by the device reset.
+    pub fn is_resetting(&self) -> bool {
+        self.data.is_resetting()
+    }
+
     fn ensure_running(&self) -> Result<(), NtStatus> {
         if self.data.is_resetting() {
             Err(NtStatus(STATUS::REINITIALIZATION_NEEDED))
@@ -2290,7 +2379,7 @@ impl GpuChannel {
             crate::bringup::record("BlobCreateLargeEntries", entries.len() as u32);
         }
         let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
-        let response = self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
+        let response = self.control.request_blocking_buf(input, output, blocking_timeout())?;
         let resp = commands::CtrlHeader::read_from_prefix(response.as_ref()).unwrap().0;
         map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
             warn!("{}: failed to create resource blob {} ({})", function!(), res_id.get(), blob_id)
@@ -2299,11 +2388,16 @@ impl GpuChannel {
         Ok(())
     }
 
-    pub fn resource_map_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, size: u64) -> Result<(offset_allocator::Allocation, u64, u32), NtStatus> {
+    pub fn resource_map_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, size: u64) -> Result<(BlobMapHandle, u64, u32), NtStatus> {
         let pages = (size / (PAGE_SIZE as u64)) as u32;
 
-        let offset = self.data.offset_allocator.lock().allocate(pages).ok_or(STATUS::NO_MEMORY)?;
-        let bar_offset = (offset.offset as u64) * (PAGE_SIZE as u64);
+        let alloc = self.data.offset_allocator.lock().allocate(pages).ok_or(STATUS::NO_MEMORY)?;
+        let bar_offset = (alloc.offset as u64) * (PAGE_SIZE as u64);
+        let handle = BlobMapHandle {
+            alloc,
+            bar_offset,
+            generation: self.data.generation,
+        };
 
         let cmd = commands::ResourceMapBlob {
             header: self.new_header(commands::Command::RESOURCE_MAP_BLOB, true, Some(ctx_id), None),
@@ -2312,19 +2406,43 @@ impl GpuChannel {
             offset: bar_offset,
         };
 
-        let map_info = self.control.request_blocking::<_, commands::RespMapInfo>(cmd)?;
-        map_virtio_error!(map_info.header.check_type(commands::Command::OK_MAP_INFO)).inspect_err(|_|
+        let map_info = match self.control.request_blocking::<_, commands::RespMapInfo>(cmd) {
+            Ok(map_info) => map_info,
+            Err(status) => {
+                // The host refused the mapping: the offset was never published
+                // outside this function, so it is still owned by the allocator
+                // that created it and can be returned there safely.
+                self.data.offset_allocator.lock().free(alloc);
+                return Err(status);
+            }
+        };
+        if let Err(status) = map_virtio_error!(map_info.header.check_type(commands::Command::OK_MAP_INFO)).inspect_err(|_|
             warn!("{}: failed to map blob {}", function!(), res_id.get())
-        )?;
+        ) {
+            self.data.offset_allocator.lock().free(alloc);
+            return Err(status);
+        }
 
         let mapping_offset = crate::boot_pool::mapping_offset(
             map_info.map_info, map_info._padding, bar_offset,
         );
-        Ok((offset, mapping_offset, map_info.map_info))
+        Ok((handle, mapping_offset, map_info.map_info))
     }
 
-    pub fn resource_unmap_blob(&self, id: NonZero<u32>, offset: offset_allocator::Allocation) -> Result<(), NtStatus> {
-        self.data.offset_allocator.lock().free(offset);
+    pub fn resource_unmap_blob(&self, id: NonZero<u32>, handle: BlobMapHandle) -> Result<(), NtStatus> {
+        // A handle from another generation belongs to an allocator that was
+        // destroyed by a TDR reset.  Dropping it is the only correct action:
+        // freeing it here would release a node this allocator never handed out
+        // (offset-allocator's `assert!(used)` -> panic -> 0xDEADDEAD).
+        if handle.generation != self.data.generation {
+            warn!(
+                "{}: dropping stale blob mapping for resource {} (generation {} != {})",
+                function!(), id.get(), handle.generation, self.data.generation
+            );
+            return Ok(());
+        }
+
+        self.data.offset_allocator.lock().free(handle.alloc);
 
         let cmd = commands::ResourceUnmapBlob {
             header: self.new_header(commands::Command::RESOURCE_UNMAP_BLOB, true, None, None),
@@ -2436,7 +2554,7 @@ impl GpuChannel {
         };
         input.as_mut().copy_from_slice(unsafe { dma.as_ref() });
         let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
-        let response = self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
+        let response = self.control.request_blocking_buf(input, output, blocking_timeout())?;
         let resp = commands::CtrlHeader::read_from_prefix(response.as_ref()).unwrap().0;
         // An error response completes the transport request, but does not
         // mean that the layout query succeeded or populated its output buffer.
@@ -2667,6 +2785,22 @@ impl GpuChannel {
         Ok(())
     }
 
+    /// Disable a scanout on the host (resource_id 0, as defined by virtio-gpu).
+    /// Must be sent before the OS frees the presented surface: a host that keeps
+    /// scanning out a released resource is how a display switch turns into a
+    /// faulted GPU and a 0x116.
+    pub fn clear_scanout(&self, scanout: u32) -> Result<(), NtStatus> {
+        let cmd = commands::SetScanout {
+            header: self.new_header(commands::Command::SET_SCANOUT, false, None, None),
+            rect: commands::Rect { width: 0, height: 0, x: 0, y: 0 },
+            scanout_id: scanout,
+            resource_id: 0,
+        };
+
+        self.control.request_async::<_, commands::CtrlHeader>(cmd, Callback::None)?;
+
+        Ok(())
+    }
     pub fn set_scanout_blob(&self, rect: commands::Rect, scanout: u32, res_id: NonZero<u32>, info: BlobInfo) -> Result<(), NtStatus> {
         let cmd = commands::SetScanoutBlob {
             header: self.new_header(commands::Command::SET_SCANOUT_BLOB, false, None, None),
@@ -2929,7 +3063,7 @@ impl QueueHandler {
                 };
                 timeout(NtTime::relative_ms(5)) => {
                     // Poll fallback for lost device interrupts: Gunyah never
-                    // wakes a WFI vCPU for the INTx (win3d/docs/GPU间隔卡顿-20260918.md),
+                    // wakes a WFI vCPU for the INTx (win3d/docs/GPU闂傛挳娈ч崡锟犮€?20260918.md),
                     // so during blob-allocation storms the irq events stay unset and
                     // every blocking request (D3DKMTAllocate et al) freezes the desktop
                     // ~1s until a timer wake. Draining the used rings here bounds that
@@ -3028,7 +3162,9 @@ impl QueueHandler {
         if let Some(thread) = self.thread.thread().take() {
             info!("{}: waiting for queue handler thread to finish...", function!());
             crate::bringup::record("TdrResetStage", 14);
-            let _ = thread.join(NtTime::INFINITE).inspect_err(|e|
+            // Bounded: an unbounded join in the TDR/reset path is a hang of the
+            // whole machine if the worker is stuck in a wedged host request.
+            let _ = thread.join(NtTime::relative_ms(5_000)).inspect_err(|e|
                 error!("{}: failed to wait for thread to finish: {:?}", function!(), e)
             );
             crate::bringup::record("TdrResetStage", 15);
@@ -3041,12 +3177,20 @@ impl QueueHandler {
 
         /* Reset while the QueueHandler still owns the VirtQueue descriptor and
          * ring memory. Wait for the device to acknowledge reset before that
-         * memory can be released. */
+         * memory can be released - but never forever: a wedged host that does
+         * not ack would otherwise spin the CPU with interrupts off until the
+         * TDR watchdog fires. */
         let reset_status = virtio_drivers::transport::DeviceStatus::empty();
         crate::bringup::record("TdrResetStage", 17);
         self.pci_transport.set_status(reset_status);
         crate::bringup::record("TdrResetStage", 18);
+        let (started, freq) = ke_query_performance_counter();
+        let deadline = started + 2 * freq.max(1);
         while self.pci_transport.get_status() != reset_status {
+            if ke_query_performance_counter().0 >= deadline {
+                warn!("{}: device did not acknowledge reset within 2 s, continuing", function!());
+                break;
+            }
             core::hint::spin_loop();
         }
         crate::bringup::record("TdrResetStage", 19);

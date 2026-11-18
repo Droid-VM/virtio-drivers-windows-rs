@@ -212,6 +212,17 @@ impl Device {
         self.chan.dxgk_interface()
     }
 
+    /// True once the channel behind this device was stopped by a TDR reset.
+    /// The host-side context/resource ids are gone with it.
+    pub fn is_resetting(&self) -> bool {
+        self.chan.is_resetting()
+    }
+
+    /// Generation of the channel behind this device (see `BlobMapHandle`).
+    pub fn generation(&self) -> u64 {
+        self.chan.generation()
+    }
+
     pub fn init_context(&self, supported_capsets: CapsetMask, params: &ContextInit) -> Result<(), NtStatus> {
         if !supported_capsets.contains(params.capset_id.into()) {
             error!("unsupported capset: {:?}", { params.capset_id });
@@ -520,6 +531,22 @@ impl Device {
         Ok(copy)
     }
 
+    /// `present_dump` gate: hand the presented surface to the capture helper,
+    /// which decides on its own whether the diagnostic is armed.
+    fn dump_present_surface(src: &DeviceSpecificAllocation, present: &DXGKARG_PRESENT) {
+        let Some(alloc) = src.alloc.upgrade() else { return };
+        let flags = (present.Flags.Blt() as u32)
+            | ((present.Flags.Flip() as u32) << 1)
+            | ((present.Flags.FlipWithNoWait() as u32) << 2)
+            | ((present.Flags.ColorFill() as u32) << 3);
+        crate::present_dump::maybe_dump(
+            &alloc,
+            (present.SrcRect.left, present.SrcRect.top, present.SrcRect.right, present.SrcRect.bottom),
+            (present.DstRect.left, present.DstRect.top, present.DstRect.right, present.DstRect.bottom),
+            flags,
+        );
+    }
+
     pub fn present(&self, present: &mut DXGKARG_PRESENT) -> Result<(), NtStatus> {
         trace!("{}: device: {:?}, flags: {:?}", function!(), self, present.Flags);
 
@@ -538,11 +565,15 @@ impl Device {
             } else {
                 warn!("{}: no destination allocation, flags: {:?}", function!(), present.Flags);
             }
+            Self::dump_present_surface(&src, present);
             return Ok(());
         };
 
         if !present.Flags.Blt() {
             warn!("{}: no blit, flags: {:?}", function!(), present.Flags);
+            // Flip presents never reach the blit path below, but the desktop
+            // composite arrives that way: capture it too.
+            Self::dump_present_surface(&src, present);
             return Ok(());
         }
 
@@ -563,6 +594,11 @@ impl Device {
 
         trace!("{}: src: {:?}", function!(), src_alloc);
         trace!("{}: dst: {:?}", function!(), dst_alloc);
+
+        // Field debugging aid (off unless `PresentDump` is set): capture what
+        // the KMD is actually handed, so a corrupt frame can be attributed to
+        // this driver or to the user-mode renderer without guessing.
+        Self::dump_present_surface(&src, present);
 
         let patchloc_out = slice_from_raw_parts_mut(present.pPatchLocationListOut, present.PatchLocationListOutSize as _);
 
@@ -1220,13 +1256,13 @@ impl Device {
         self.chan.resource_create_blob(ctx_id, res_id, blob_id, mem, flags, size, entries)
     }
 
-    pub fn context_map_blob(&self, res_id: NonZero<u32>, size: u64) -> Result<(offset_allocator::Allocation, u64, u32), NtStatus> {
+    pub fn context_map_blob(&self, res_id: NonZero<u32>, size: u64) -> Result<(crate::queue::BlobMapHandle, u64, u32), NtStatus> {
         let ctx_id = self.context_internal(false).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
         self.chan.resource_map_blob(ctx_id, res_id, size)
     }
 
-    pub fn context_unmap_blob(&self, res_id: NonZero<u32>, offset: offset_allocator::Allocation) -> Result<(), NtStatus> {
-        self.chan.resource_unmap_blob(res_id, offset)
+    pub fn context_unmap_blob(&self, res_id: NonZero<u32>, handle: crate::queue::BlobMapHandle) -> Result<(), NtStatus> {
+        self.chan.resource_unmap_blob(res_id, handle)
     }
 }
 

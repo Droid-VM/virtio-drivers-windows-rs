@@ -80,7 +80,15 @@ impl Write for LogEntry {
             if bytes.len() <= free.len() {
                 bytes
             } else {
-                &bytes[..free.len()]
+                // Do not cut a multi-byte UTF-8 sequence in half: the entry is
+                // later decoded with `from_utf8()`, and a half-written
+                // character makes that fail (which used to panic with the
+                // logger lock held, i.e. a panic inside the panic path).
+                let mut n = free.len();
+                while n > 0 && !s.is_char_boundary(n) {
+                    n -= 1;
+                }
+                &bytes[..n]
             }
         };
         let free = &mut free[..bytes.len()];
@@ -94,7 +102,9 @@ impl Write for LogEntry {
 impl LogEntry {
     fn as_str(&self) -> &str {
         let bytes = &self.buf[..self.len as usize];
-        str::from_utf8(&bytes).unwrap()
+        // Truncation above keeps this valid; fall back instead of panicking if
+        // memory was damaged or an older writer produced garbage.
+        str::from_utf8(bytes).unwrap_or("<invalid utf-8 log entry>")
     }
 }
 
@@ -209,6 +219,13 @@ pub fn deinit() {
 }
 
 pub unsafe fn force_flush() {
+    // Called from the panic handler: it must never panic itself, or the
+    // double panic aborts before the log (and the bugcheck parameters) are
+    // emitted.
+    let Some(msgs) = LOGGER.as_logger().msgs.as_ref() else {
+        return;
+    };
+
     if LOGGER.as_logger().uart.is_locked() {
         let mut uart = if let Some(uart) = LOGGER.as_logger().uart.try_lock_timeout(1_000_000) {
             uart
@@ -220,15 +237,16 @@ pub unsafe fn force_flush() {
         };
 
         loop {
-            let Some(entry) = LOGGER.as_logger().msgs.as_ref().unwrap().pop() else {
+            let Some(entry) = msgs.pop() else {
                 break;
             };
+            let Some(uart) = uart.as_mut() else { break; };
             writeln!(
-                uart.as_mut().unwrap(),
+                uart,
                 "[FORCE] [BUFFERED] {}",
                 entry.as_str(),
             )
-            .unwrap();
+            .ok();
         }
     } else {
         LOGGER.as_logger().flush();
@@ -237,20 +255,21 @@ pub unsafe fn force_flush() {
 
 impl Logger {
     fn try_flush(&self) {
-        let Some(mut uart) = self.uart.try_lock_timeout(10_000) else {
+        let Some(msgs) = self.msgs.as_ref() else {
             return;
         };
-        let len = self.msgs.as_ref().unwrap().len();
-        for i in 0..len {
-            let Some(entry) = self.msgs.as_ref().unwrap().pop() else {
+        let Some(mut guard) = self.uart.try_lock_timeout(10_000) else {
+            return;
+        };
+        let Some(sink) = guard.as_mut() else {
+            return;
+        };
+        let len = msgs.len();
+        for _ in 0..len {
+            let Some(entry) = msgs.pop() else {
                 break;
             };
-            writeln!(
-                uart.as_mut().unwrap(),
-                "{}",
-                entry.as_str(),
-            )
-            .unwrap();
+            writeln!(sink, "{}", entry.as_str()).ok();
         }
     }
 }
@@ -276,9 +295,14 @@ impl Log for Logger {
             "[{}] {}",
             record.level(),
             record.args()
-        ).unwrap();
+        ).ok();
 
-        self.msgs.as_ref().unwrap().force_push(entry);
+        // The logger is torn down in `deinit()`; a late log (e.g. from a
+        // worker thread racing unload) must not panic.
+        let Some(msgs) = self.msgs.as_ref() else {
+            return;
+        };
+        msgs.force_push(entry);
 
         self.try_flush();
 
@@ -339,17 +363,19 @@ impl Log for Logger {
     }
 
     fn flush(&self) {
-        let len = self.msgs.as_ref().unwrap().len();
-        for i in 0..len {
-            let Some(entry) = self.msgs.as_ref().unwrap().pop() else {
+        let Some(msgs) = self.msgs.as_ref() else {
+            return;
+        };
+        let mut guard = self.uart.lock();
+        let Some(sink) = guard.as_mut() else {
+            return;
+        };
+        let len = msgs.len();
+        for _ in 0..len {
+            let Some(entry) = msgs.pop() else {
                 break;
             };
-            writeln!(
-                self.uart.lock().as_mut().unwrap(),
-                "{}",
-                entry.as_str(),
-            )
-            .unwrap();
+            writeln!(sink, "{}", entry.as_str()).ok();
         }
     }
 }

@@ -244,8 +244,9 @@ pub enum VirtioResource {
         mem: BlobMem,
         flags: BlobFlag,
         info: RwLock<Option<BlobInfo>>,
-        // guest BAR allocator token plus the physical/pool offset used to map it
-        map: RwLock<Option<(offset_allocator::Allocation, u64)>>,
+        // guest BAR allocator token (tagged with the channel generation that
+        // handed it out) plus the physical/pool offset used to map it
+        map: RwLock<Option<(crate::queue::BlobMapHandle, u64)>>,
         size: u64,
     },
     /// A pSystemMem wrap: dxgkrnl owns the pages (MDL over the UMD's host
@@ -302,13 +303,16 @@ impl Clone for VirtioResource {
                 size,
             } => {
                 let info_val = *info.read();
-                let map_val = *map.read();
+                // A clone is a value snapshot (used to answer
+                // ESCAPE_RESOURCE_INFO); it does not own the host BAR mapping,
+                // so the offset-allocator token must not be duplicated into it
+                // or two objects would free the same node.
                 VirtioResource::Blob {
                     id: *id,
                     mem: *mem,
                     flags: *flags,
                     info: RwLock::new(info_val),
-                    map: RwLock::new(map_val),
+                    map: RwLock::new(None),
                     size: *size,
                 }
             },
@@ -550,11 +554,14 @@ impl DeviceSpecificAllocation {
     }
 
     pub fn set_mapped(&self, mapped: bool) {
-        self.alloc.upgrade().and_then(|a| Some(a.set_mapped(mapped))).unwrap();
+        match self.alloc.upgrade() {
+            Some(a) => a.set_mapped(mapped),
+            None => warn!("{}: allocation no longer exists", function!()),
+        }
     }
 
     pub fn is_mapped(&self) -> bool {
-        self.alloc.upgrade().and_then(|a| Some(a.is_mapped())).unwrap()
+        self.alloc.upgrade().map(|a| a.is_mapped()).unwrap_or(false)
     }
 }
 
@@ -575,6 +582,20 @@ impl Drop for DeviceSpecificAllocation {
             error!("{}: device no longer exists", function!());
             return;
         };
+
+        // After a TDR reset the channel behind this Device is dead: the host
+        // context went away with the device reset, and every blocking control
+        // request on it (detach/unref) waits for a response that cannot come.
+        // Those stale ids also belong to the old id space, which the new
+        // channel restarts at 1 - sending them is at best noise, at worst a
+        // detach of a live resource.  Just drop the local attachment.
+        if device.is_resetting() {
+            debug!(
+                "{}: skipping detach of resource {} on reset channel (generation {})",
+                function!(), alloc.id, device.generation()
+            );
+            return;
+        }
 
         let context_id = device.context().and_then(|id| Some(id.get())).unwrap_or(0);
         let has_virgl = *self.virgl.get_mut();
@@ -614,6 +635,12 @@ pub struct Allocation {
     primary_refresh_rate: AtomicU64,
     primary_source: AtomicU32,
     id: NonZero<u32>,
+    /// Generation of the `GpuChannel` that created this allocation.  A TDR
+    /// reset destroys that channel (and its host resource table) while dxgkrnl
+    /// keeps the allocation alive; the destroy path must then free local
+    /// bookkeeping only and must never hand the stale resource id back to the
+    /// new channel, whose id space starts over at 1.
+    generation: AtomicU64,
     //create_fence: Pin<Arc<KeEvent>>,
     flags: AtomicU32,
     resource: VirtioResource,
@@ -670,6 +697,7 @@ impl Allocation {
             primary_source: AtomicU32::new(0),
             id,
             //fence,
+            generation: AtomicU64::new(0),
             flags: AtomicU32::new(flags),
             resource,
             guest_backing,
@@ -768,6 +796,14 @@ impl Allocation {
         self.device_specific.lock().len()
     }
 
+    pub fn set_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     pub fn is_mapped(&self) -> bool {
         (self.flags.load(Ordering::SeqCst) & ALLOCATION_FLAG_MAPPED) != 0
     }
@@ -798,7 +834,7 @@ impl Allocation {
         }
     }
 
-    fn set_mapped(&self, mapped: bool) {
+    pub(crate) fn set_mapped(&self, mapped: bool) {
         Self::set_flag_mapped(&self.flags, mapped);
     }
 
@@ -868,7 +904,7 @@ impl Allocation {
             },
             VirtioResource::Blob { size, map, ..} => {
                 if let Some(map) = *map.read() {
-                    Some((map.0.offset as u64 * wdk::wdm::PAGE_SIZE as u64, *size))
+                    Some((map.0.bar_offset, *size))
                 } else {
                     None
                 }
@@ -909,10 +945,10 @@ impl Allocation {
                         error!("{}: cannot map blob multiple times: {:?}", function!(), self);
                         Err(NtStatus(STATUS::ALREADY_COMMITTED))
                     } else {
-                        let (offset_alloc, bar_offset, map_info) = device.context_map_blob(self.id, *size)?;
+                        let (handle, bar_offset, map_info) = device.context_map_blob(self.id, *size)?;
                         // Fuck borrow checker, this is stupid
                         Self::set_flag_mapped(&self.flags, true);
-                        map.write().replace((offset_alloc, bar_offset));
+                        map.write().replace((handle, bar_offset));
                         Ok((bar_offset, *size, map_info))
                     }
                 } else {
@@ -924,24 +960,30 @@ impl Allocation {
     }
 
     pub fn unmap_blob(&self, device: &Device) -> Result<(), NtStatus> {
-        if self.is_mapped() {
-            self.set_mapped(false);
-            let offset_alloc = match &self.resource {
-                VirtioResource::Sysmem { .. } => {
-                    error!("{}: sysmem wrap cannot be blob-mapped", function!());
-                    return Err(NtStatus(STATUS::INVALID_PARAMETER));
-                },
-                VirtioResource::_3D {..} => {
-                    unreachable!();
-                },
-                VirtioResource::Blob {map, ..} => {
-                    map.write().take().unwrap().0
-                },
-            };
-            device.context_unmap_blob(self.id, offset_alloc)
-        } else {
-            warn!("{}: cannot unmap not mapped resource: {:?}", function!(), self);
-            Err(NtStatus(STATUS::INVALID_PARAMETER))
+        // Take the token out of the allocation *before* touching the
+        // allocator so a racing/repeated unmap cannot free it twice.
+        let handle = match &self.resource {
+            VirtioResource::Sysmem { .. } => {
+                error!("{}: sysmem wrap cannot be blob-mapped", function!());
+                return Err(NtStatus(STATUS::INVALID_PARAMETER));
+            },
+            VirtioResource::_3D {..} => {
+                error!("{}: 3d resource cannot be blob-mapped: {:?}", function!(), self);
+                return Err(NtStatus(STATUS::INVALID_PARAMETER));
+            },
+            VirtioResource::Blob {map, ..} => map.write().take(),
+        };
+
+        match handle {
+            Some((handle, _)) => {
+                self.set_mapped(false);
+                device.context_unmap_blob(self.id, handle)
+            },
+            None => {
+                warn!("{}: cannot unmap not mapped resource: {:?}", function!(), self);
+                self.set_mapped(false);
+                Err(NtStatus(STATUS::INVALID_PARAMETER))
+            },
         }
     }
 
