@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 [dependencies]
 wdk = { path = "../wdk" }
 winresult.workspace = true
+microseh = { path = "../util/microseh", features = [], default-features = false }

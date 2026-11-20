@@ -1,13 +1,123 @@
 ;;
-;; virtio_media.inf — DroidVM virtio-media function driver (KMDF, skeleton)
+;; virtio_media.inf - DroidVM virtio-media driver (KMDF, ARM64)
 ;;
-;; Matches the virtio-media PCI functions that crosvm creates with
-;;   --virtio-media kind=decoder,uid=... / kind=encoder,uid=...
-;; virtio device type VIRTIO_ID_MEDIA = 48, so the PCI device id is
-;;   0x1040 + 48 = 0x1070, vendor 0x1AF4, subsys 0x1070:0x1AF4, revision 1.
+;; Matches:
+;;   * the two virtio-media PCI functions crosvm creates with
+;;     --virtio-media kind=decoder,uid=... / kind=encoder,uid=...
+;;     (VIRTIO_ID_MEDIA = 48 -> PCI device id 0x1070, vendor 0x1AF4), and
+;;   * the ACPI DRVM0001 pool device whose _UID is MEDIA_HOST. edk2's
+;;     GunyahPoolAcpiDxe creates it from the `media_host` device-tree node; its
+;;     _CRS memory resource is the guest-physical base/size of the buffer pool
+;;     that the virtio-media MMAP commands answer offsets into.
 ;;
-;; P1c-3: virtio 1.x bring-up through ResourcesTranslated + MmMapIoSpaceEx;
-;;        no PCI configuration-space access at all.
+;; P1d-2: keep the OPEN session and decode one H.264 IDR access unit through the
+;; host MediaCodec (SOURCE_CHANGE=5, errno preserved); dump the NV12 frame to
+;; C:\DroidVM\p1d\frame.raw.
+;;
+;; P3 (1.0.0.10): multi-AU streaming session.  The first SEND configures the
+;; host session (S_FMT/REQBUFS/MMAP/STREAMON) and queues the first access unit;
+;; every later SEND queues another AU on the same session, GET_FRAME returns one
+;; decoded frame per AU and re-queues the CAPTURE buffer, so P/B pictures keep
+;; their reference frames instead of starting a new one-shot session per frame.
+;;
+;; P2-2f (1.0.0.9): session lifecycle.  CLOSE now sends the full 16-byte
+;; CmdHeader+CloseCmd the host expects (1.0.0.7 sent 8 bytes, so the host
+;; answered EINVAL and kept the session, wedging every later OPEN with
+;; STATUS_INVALID_DEVICE_STATE / err 22); a refused CLOSE still clears the guest
+;; state; and an OPEN that finds a session open closes it first instead of
+;; failing.  CLOSE also MUNMAPs the session's pool ranges: closing alone did not
+;; give the media_host address space back, so REQBUFS started failing with
+;; ENOMEM once two sessions had decoded.
+;;
+;; P3-2 (1.0.0.11): VM_IOCTL_FLUSH (0x00222010) drops the queued AUs/frames and
+;; restarts the host session, so seek / loop / pause-resume decode from a fresh
+;; IDR instead of a decoder that still holds the old references.
+;;
+;; P-BATCH MSI-X (1.0.0.17): the driver no longer polls the used ring.  The INF
+;; asks for exactly one MSI-X message (both virtqueues share it, which the virtio
+;; spec allows), the queue_msix_vector index comes from the raw resource list, and
+;; the transport waits on an event that the interrupt work item signals.  The
+;; polling path is kept as the fallback and is what runs whenever the OS does not
+;; grant a message interrupt.  See deliverables/P-BATCH-MSIX.md (repo root).
+;;
+;; MERGE-20261024 (1.0.0.19): this INF ships the merged driver.  All eight
+;; P-BATCH patches are in one binary: the VP9/HEVC/AV1 codec selector as a single
+;; VM_OPEN_IN.Codec field (0 = H.264, 1 = VP9, 2 = HEVC, 3 = AV1), MSI-X, P010
+;; passthrough, D3D12 DECODER_HEAP_SIZE (UMD side) and
+;; VM_IOCTL_MAP_FRAME (0x00222014) / VM_IOCTL_RELEASE_FRAME (0x00222018).
+;; No ABI change against 1.0.0.18 -- the IOCTL table is unchanged.
+;;
+;; P-BATCH POOLFIX (1.0.0.20 / E173): same binary interface as 1.0.0.19.  The
+;; driver now sizes the CAPTURE queue from the media_host pool it was actually
+;; given (ask = min(20, pool/sizeimage - 2), at least 2) and rolls a failed
+;; configure back (STREAMOFF + MUNMAP + REQBUFS(0)) instead of leaving the host
+;; queue charged, which is what made 1920x1152 AV1/HEVC sessions fail with
+;; err=1450 and poisoned every later codec until a reboot.
+;;
+;; HEVC-MAIN10 (1.0.0.21): VM_OPEN_IN.Codec value 4 opens an HEVC Main10 session.
+;; The OUTPUT format is the same 'HEVC' as Main (the same host decoder decodes
+;; both); the difference is the CAPTURE queue: it is negotiated as
+;; V4L2_PIX_FMT_P010 (10-bit 4:2:0, two planes of 16-bit words, a row is
+;; width * 2 bytes) and falls back to V4L2_PIX_FMT_NV12 with a log line when the
+;; device refuses P010.  No IOCTL or struct-layout change against 1.0.0.20; the
+;; UMD checks DriverVersion 0x00010015 before it offers the Main10 profile.
+;;
+;; CONCURRENT-MAPPING (1.0.0.22): MAP_FRAME/RELEASE_FRAME now work per capture
+;; buffer instead of one mapping per session.  A session that REQBUFS granted 18
+;; buffers can have 18 frames mapped at once (that is the pool's limit), a second
+;; MAP_FRAME is no longer refused with STATUS_INVALID_DEVICE_STATE (user mode
+;; err=22), RELEASE_FRAME(index) frees exactly that index and 0xFFFFFFFF still
+;; means "release all".  CLOSE / FLUSH / OPEN-over-a-stale-session / device
+;; teardown release the whole table before the pool mapping is torn down.  No
+;; IOCTL code, no struct size and no VMEDIA_ABI_VERSION change; a UMD can check
+;; DriverVersion 0x00010016 (VMEDIA_MULTI_MAPPING_MIN_VERSION) before it keeps
+;; more than one frame in flight, and a pre-1.0.0.22 UMD runs unchanged.
+;;
+;; CACHED-POOL (1.0.0.23): the media_host pool and the per-frame user windows
+;; MAP_FRAME hands out are mapped MmCached instead of MmNonCached, with the
+;; cache maintained per frame (dc ivac over a decoded frame before the caller
+;; reads it; dc civac after an access unit is written into an OUTPUT buffer).
+;; WHY: the pool is RAM the host writes and the guest reads, and a noncached
+;; read of one 1080p NV12 frame cost 30.35 ms (103 MB/s) -- 99% of the UMD's
+;; upload budget.  The same read from a cached mapping is ~0.5 ms, and the
+;; invalidate that makes it correct is tens of microseconds.
+;; No IOCTL code, no struct size and no VMEDIA_ABI_VERSION change; DriverVersion
+;; is 0x00010017.  A pre-1.0.0.23 UMD runs unchanged (and gets the speed-up for
+;; free, because the mapping was the driver's choice, not the client's).
+;;
+;; No PCI configuration-space access: the BARs come from ResourcesTranslated.
+;;
+;; SESSION-OWNERSHIP (1.0.0.24): identity, ordering and recovery (author doc
+;; 5.4).  VM_IOCTL_OPEN returns a **generation token** in VM_OPEN_OUT.SessionToken
+;; (the old Reserved0 slot: same 32-byte struct) and every later IOCTL carries it
+;; back -- VM_IOCTL_CLOSE / FLUSH / RELEASE_FRAME in the SessionToken field that
+;; grew their input struct to 16 bytes, VM_IOCTL_GET_FRAME / MAP_FRAME in the same
+;; 8 extra bytes, and VM_IOCTL_SEND_BITSTREAM_EX (0x0022201C, new code, 24-byte
+;; header) for SEND.  One driver function now keeps **two** sessions alive,
+;; because Chromium builds two decoder wrappers and both are open for the lifetime
+;; of the second OPEN; CLOSE / FLUSH / RELEASE_FRAME / MAP_FRAME / GET_FRAME /
+;; SEND only act on the session that owns the token, and a CLOSE that names a
+;; replaced session is ignored instead of tearing down the live one.  FLUSH and a
+;; re-OPEN bump the generation.  A request with token 0 is a pre-1.0.0.24 client
+;; and is accepted only while it is the only session open (logged as `legacy`);
+;; the UMD tells the two drivers apart with DriverVersion 0x00010018 and must not
+;; use SEND_BITSTREAM_EX below it.
+;; **Install the .sys and the UMDs from this package together.**
+;;
+;; PER-SESSION-LIVESTATE (1.0.0.25): fixes the dual-session failure that 1.0.0.24
+;; exposed (doc 37).  The event queue is one hardware queue and the host tags every
+;; event with the session it belongs to; 1.0.0.24 read an event for the *other*
+;; session, logged `event for session N (ours M) ignored` and dropped it.  The
+;; other session therefore never got its `DQBUF(OUTPUT)` back, both of its OUTPUT
+;; buffers stayed lent, and its next SEND ended in `no free OUTPUT buffer after
+;; 4000 spins` == BeginFrame 0x80004005 (Edge lost its decoder ~1-2 s after
+;; PotPlayer opened a second session, twice).  This build applies such a
+;; completion to the session that owns it (its buffer masks, its pending-frame
+;; queue, its error latch) and the async QBUF errno now carries its owner slot, so
+;; one session's dropped access unit no longer fails the other's next SEND.
+;; **No ABI change at all**: same IOCTL codes, same struct layouts, same
+;; VMEDIA_ABI_VERSION 1 and DriverVersion stays 0x00010018 -- a 1.0.0.24 UMD runs
+;; unchanged against it.  Only the driver's internal version moves (1.0.0.25).
 ;;
 
 [Version]
@@ -16,7 +126,7 @@ Class          = Media
 ClassGuid      = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider       = %ManufacturerName%
 CatalogFile    = virtio_media.cat
-DriverVer      = 10/21/2026,1.0.0.4
+DriverVer      = 11/20/2026,1.0.0.36
 PnpLockdown    = 1
 
 [DestinationDirs]
@@ -32,10 +142,14 @@ virtio_media.sys = 1,,
 %ManufacturerName% = DroidVM,NTARM64
 
 [DroidVM.NTARM64]
-; full hardware id as enumerated by the virtio-pci transport
+; Full hardware id as enumerated by the virtio-pci transport.
 %VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070&SUBSYS_10701AF4&REV_01
 %VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070&SUBSYS_10701AF4
 %VirtioMedia.DeviceDesc% = VirtioMedia_Device, PCI\VEN_1AF4&DEV_1070
+; The media_host pool. DRVM0001 is shared by all pools; the driver checks the
+; instance id (...\MEDIA_HOST) in PrepareHardware and only takes that pool's
+; memory resource. The other pools are bound but left idle.
+%VirtioMedia.PoolDesc% = VirtioMedia_Device, ACPI\DRVM0001
 
 [VirtioMedia_Device.NT]
 CopyFiles = VirtioMedia_Files.Drivers
@@ -63,12 +177,31 @@ KmdfService = VirtioMedia,VirtioMedia_wdfsect
 [VirtioMedia_wdfsect]
 KmdfLibraryVersion = 1.27
 
-; MSI-X is intentionally absent: this skeleton does not own an interrupt.
-; [VirtioMedia_Device.NT.HW]
-; AddReg = VirtioMedia_MSIX
+; --- MSI-X (P-BATCH MSI-X, 1.0.0.17) ---------------------------------------
+;
+; 0x00000010 = FLG_ADDREG_KEYONLY: create the key, write no value.
+; MSISupported = 1 asks the PCI bus driver for message-signaled interrupts.
+; MessageNumberLimit = 1 asks for exactly one message: virtio-media only needs
+; one line ("something was used"), both virtqueues program the same MSI-X table
+; entry (the virtio spec allows sharing a vector between queues) and a single
+; message keeps the index mapping unambiguous.  The resource list then reports
+; `MessageInterrupt.Raw.MessageCount = 1` and the driver programs that table
+; entry into both queues.
+;
+; Deleting or lowering MessageNumberLimit is a supported way to force the
+; polling path back on: the driver notices that no message interrupt was granted
+; and leaves both queues at VIRTIO_MSI_NO_VECTOR, exactly like 1.0.0.16.
+[VirtioMedia_Device.NT.HW]
+AddReg = VirtioMedia_MSIX
+
+[VirtioMedia_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 1
 
 [Strings]
 ManufacturerName       = "DroidVM"
 DiskName               = "DroidVM virtio-media Installation Disk"
 VirtioMedia.DeviceDesc = "DroidVM Video Media"
+VirtioMedia.PoolDesc   = "DroidVM Media Pool"
 VirtioMedia.Service    = "DroidVM virtio-media driver"
